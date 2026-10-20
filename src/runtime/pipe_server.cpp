@@ -37,7 +37,10 @@ public:
 		}
 	}
 
+	/// Prevents duplicating ownership of a kernel handle.
 	UniqueHandle(const UniqueHandle&) = delete;
+
+	/// Prevents copy assignment of a kernel handle.
 	UniqueHandle& operator=(const UniqueHandle&) = delete;
 
 	/// Transfers handle ownership from another wrapper.
@@ -91,88 +94,75 @@ struct LocalFreeDeleter
 
 using LocalAllocation = std::unique_ptr<void, LocalFreeDeleter>;
 
-/// Holds a self-relative descriptor and attributes that reference it.
-struct PipeSecurity
-{
-	LocalAllocation descriptor;
-	SECURITY_ATTRIBUTES attributes;
-};
+using mcd::runtime::detail::IoResult;
+using mcd::runtime::detail::IoStatus;
+using mcd::runtime::detail::io_failure;
 
-/// Names the outcome of one cancellable pipe operation.
-enum class IoResult
-{
-	success,
-	stopped,
-	failed,
-};
-
-/// Throws a system error carrying the current Win32 failure code.
-[[noreturn]] void throw_last_error(const char* operation)
+/// Throws a system error carrying a previously captured Win32 failure code.
+[[noreturn]] void throw_win32_error(const DWORD error, const char* operation)
 {
 	throw std::system_error(
-		static_cast<int>(GetLastError()),
+		static_cast<int>(error),
 		std::system_category(),
 		operation);
 }
 
-/// Builds a protected pipe DACL granting access only to the current logon SID.
-PipeSecurity current_user_pipe_security()
+/// Returns token information bytes or throws with the originating Win32 error.
+std::vector<std::byte> token_information(
+	const HANDLE token,
+	const TOKEN_INFORMATION_CLASS information_class)
 {
-	HANDLE raw_token = nullptr;
-	if(!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token))
+	DWORD size = 0U;
+	if(GetTokenInformation(token, information_class, nullptr, 0U, &size))
 	{
-		throw_last_error("OpenProcessToken");
-	}
-	UniqueHandle token(raw_token);
-
-	DWORD token_size = 0U;
-	GetTokenInformation(token.get(), TokenUser, nullptr, 0U, &token_size);
-	if(GetLastError() != ERROR_INSUFFICIENT_BUFFER)
-	{
-		throw_last_error("GetTokenInformation(size)");
+		throw std::runtime_error("Token information unexpectedly had no payload.");
 	}
 
-	std::vector<std::byte> token_buffer(token_size);
+	const DWORD size_error = GetLastError();
+	if(size_error != ERROR_INSUFFICIENT_BUFFER)
+	{
+		throw_win32_error(size_error, "GetTokenInformation(size)");
+	}
+
+	std::vector<std::byte> buffer(size);
 	if(!GetTokenInformation(
-		   token.get(),
-		   TokenUser,
-		   token_buffer.data(),
-		   token_size,
-		   &token_size))
+		   token,
+		   information_class,
+		   buffer.data(),
+		   size,
+		   &size))
 	{
-		throw_last_error("GetTokenInformation");
+		const DWORD error = GetLastError();
+		throw_win32_error(error, "GetTokenInformation");
 	}
+	return buffer;
+}
 
-	const auto* token_user = reinterpret_cast<const TOKEN_USER*>(token_buffer.data());
+/// Converts one valid SID to SDDL text.
+std::wstring sid_string(const PSID sid)
+{
 	LPWSTR raw_sid_text = nullptr;
-	if(!ConvertSidToStringSidW(token_user->User.Sid, &raw_sid_text))
+	if(!ConvertSidToStringSidW(sid, &raw_sid_text))
 	{
-		throw_last_error("ConvertSidToStringSidW");
+		const DWORD error = GetLastError();
+		throw_win32_error(error, "ConvertSidToStringSidW");
 	}
 	LocalAllocation sid_text(raw_sid_text);
+	return std::wstring(static_cast<const wchar_t*>(sid_text.get()));
+}
 
-	const std::wstring sddl =
-		L"D:P(A;;GA;;;" + std::wstring(static_cast<const wchar_t*>(sid_text.get())) + L")";
-	PSECURITY_DESCRIPTOR raw_descriptor = nullptr;
-	if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-		   sddl.c_str(),
-		   SDDL_REVISION_1,
-		   &raw_descriptor,
-		   nullptr))
+/// Returns the current token's group marked as its logon SID.
+PSID logon_sid(const std::vector<std::byte>& groups_buffer)
+{
+	const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(groups_buffer.data());
+	for(DWORD index = 0U; index < groups->GroupCount; ++index)
 	{
-		throw_last_error("ConvertStringSecurityDescriptorToSecurityDescriptorW");
+		if((groups->Groups[index].Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID)
+		{
+			return groups->Groups[index].Sid;
+		}
 	}
-
-	LocalAllocation descriptor(raw_descriptor);
-	SECURITY_ATTRIBUTES attributes {
-		.nLength = sizeof(SECURITY_ATTRIBUTES),
-		.lpSecurityDescriptor = descriptor.get(),
-		.bInheritHandle = FALSE,
-	};
-	return PipeSecurity {
-		.descriptor = std::move(descriptor),
-		.attributes = attributes,
-	};
+	throw std::runtime_error("Current token does not contain a logon SID.");
 }
 
 /// Returns the process-specific local control pipe name.
@@ -197,17 +187,28 @@ IoResult await_operation(
 	if(wait_result == WAIT_OBJECT_0)
 	{
 		CancelIoEx(pipe, &operation);
-		(void)WaitForSingleObject(operation.hEvent, INFINITE);
-		return IoResult::stopped;
+		const DWORD completion_wait = WaitForSingleObject(operation.hEvent, INFINITE);
+		if(completion_wait == WAIT_FAILED)
+		{
+			return io_failure(GetLastError());
+		}
+		return {.status = IoStatus::stopped, .error = ERROR_OPERATION_ABORTED};
 	}
 
-	if(wait_result != WAIT_OBJECT_0 + 1U ||
-	   !GetOverlappedResult(pipe, &operation, &transferred, FALSE))
+	if(wait_result == WAIT_FAILED)
 	{
-		return IoResult::failed;
+		return io_failure(GetLastError());
+	}
+	if(wait_result != WAIT_OBJECT_0 + 1U)
+	{
+		return io_failure(ERROR_GEN_FAILURE);
+	}
+	if(!GetOverlappedResult(pipe, &operation, &transferred, FALSE))
+	{
+		return io_failure(GetLastError());
 	}
 
-	return IoResult::success;
+	return {.status = IoStatus::success, .error = ERROR_SUCCESS};
 }
 
 /// Transfers exactly one bounded byte span unless stopped or disconnected.
@@ -220,68 +221,75 @@ IoResult transfer_exact(
 	std::size_t offset = 0U;
 	while(offset < bytes.size())
 	{
-		UniqueHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-		if(!event.valid())
+		const HANDLE raw_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if(raw_event == nullptr)
 		{
-			return IoResult::failed;
+			return io_failure(GetLastError());
 		}
+		UniqueHandle event(raw_event);
 
 		OVERLAPPED operation {};
 		operation.hEvent = event.get();
 		DWORD transferred = 0U;
 		const DWORD remaining = static_cast<DWORD>(bytes.size() - offset);
 		const BOOL completed = writing
-			? WriteFile(pipe, bytes.data() + offset, remaining, &transferred, &operation)
-			: ReadFile(pipe, bytes.data() + offset, remaining, &transferred, &operation);
+			? WriteFile(pipe, bytes.data() + offset, remaining, nullptr, &operation)
+			: ReadFile(pipe, bytes.data() + offset, remaining, nullptr, &operation);
 
 		if(!completed)
 		{
-			if(GetLastError() != ERROR_IO_PENDING)
+			const DWORD error = GetLastError();
+			if(error != ERROR_IO_PENDING)
 			{
-				return IoResult::failed;
+				return io_failure(error);
 			}
 
 			const IoResult result = await_operation(pipe, operation, stop_event, transferred);
-			if(result != IoResult::success)
+			if(result.status != IoStatus::success)
 			{
 				return result;
 			}
 		}
+		else if(!GetOverlappedResult(pipe, &operation, &transferred, TRUE))
+		{
+			return io_failure(GetLastError());
+		}
 
 		if(transferred == 0U)
 		{
-			return IoResult::failed;
+			return io_failure(ERROR_BROKEN_PIPE);
 		}
 		offset += transferred;
 	}
 
-	return IoResult::success;
+	return {.status = IoStatus::success, .error = ERROR_SUCCESS};
 }
 
 /// Accepts one client while allowing shutdown to cancel the pending connection.
 IoResult connect_client(const HANDLE pipe, const HANDLE stop_event)
 {
-	UniqueHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-	if(!event.valid())
+	const HANDLE raw_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if(raw_event == nullptr)
 	{
-		return IoResult::failed;
+		return io_failure(GetLastError());
 	}
+	UniqueHandle event(raw_event);
 
 	OVERLAPPED operation {};
 	operation.hEvent = event.get();
 	if(ConnectNamedPipe(pipe, &operation))
 	{
-		return IoResult::success;
+		return {.status = IoStatus::success, .error = ERROR_SUCCESS};
 	}
 
 	const DWORD error = GetLastError();
 	if(error == ERROR_PIPE_CONNECTED)
 	{
-		return IoResult::success;
+		return {.status = IoStatus::success, .error = ERROR_SUCCESS};
 	}
 	if(error != ERROR_IO_PENDING)
 	{
-		return IoResult::failed;
+		return io_failure(error);
 	}
 
 	DWORD transferred = 0U;
@@ -296,7 +304,7 @@ IoResult read_frame(
 {
 	frame.assign(mcd::protocol::header_size, std::byte {0});
 	IoResult result = transfer_exact(pipe, frame, false, stop_event);
-	if(result != IoResult::success)
+	if(result.status != IoStatus::success)
 	{
 		return result;
 	}
@@ -304,13 +312,13 @@ IoResult read_frame(
 	const std::uint32_t payload_size = mcd::wire::read_u32_le(frame, 7U);
 	if(payload_size > mcd::protocol::maximum_payload_size)
 	{
-		return IoResult::failed;
+		return io_failure(ERROR_BUFFER_OVERFLOW);
 	}
 
 	frame.resize(mcd::protocol::header_size + payload_size);
 	if(payload_size == 0U)
 	{
-		return IoResult::success;
+		return {.status = IoStatus::success, .error = ERROR_SUCCESS};
 	}
 
 	return transfer_exact(
@@ -333,6 +341,48 @@ std::vector<std::byte> status_payload(const std::string_view profile_id)
 }
 }
 
+namespace mcd::runtime::detail
+{
+/// Builds a self-relative pipe descriptor for the current logon session.
+std::vector<std::byte> build_pipe_security_descriptor()
+{
+	HANDLE raw_token = nullptr;
+	if(!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token))
+	{
+		const DWORD error = GetLastError();
+		throw_win32_error(error, "OpenProcessToken");
+	}
+	UniqueHandle token(raw_token);
+
+	const auto groups_buffer = token_information(token.get(), TokenGroups);
+	const auto owner_buffer = token_information(token.get(), TokenOwner);
+	const auto primary_group_buffer = token_information(token.get(), TokenPrimaryGroup);
+	const auto* owner = reinterpret_cast<const TOKEN_OWNER*>(owner_buffer.data());
+	const auto* primary_group =
+		reinterpret_cast<const TOKEN_PRIMARY_GROUP*>(primary_group_buffer.data());
+	const std::wstring sddl =
+		L"O:" + sid_string(owner->Owner) +
+		L"G:" + sid_string(primary_group->PrimaryGroup) +
+		L"D:P(A;;GRGW;;;" + sid_string(logon_sid(groups_buffer)) + L")";
+
+	PSECURITY_DESCRIPTOR raw_descriptor = nullptr;
+	if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+		   sddl.c_str(),
+		   SDDL_REVISION_1,
+		   &raw_descriptor,
+		   nullptr))
+	{
+		const DWORD error = GetLastError();
+		throw_win32_error(error, "ConvertStringSecurityDescriptorToSecurityDescriptorW");
+	}
+	LocalAllocation descriptor(raw_descriptor);
+
+	const DWORD descriptor_size = GetSecurityDescriptorLength(descriptor.get());
+	const auto* bytes = static_cast<const std::byte*>(descriptor.get());
+	return std::vector<std::byte>(bytes, bytes + descriptor_size);
+}
+}
+
 namespace mcd::runtime
 {
 /// Stores the platform resources and immutable status identity of a pipe server.
@@ -341,13 +391,15 @@ class PipeServer::Impl
 public:
 	/// Creates the cooperative stop event and records the selected profile.
 	explicit Impl(const std::string_view profile_id)
-		: stop_event_(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
-		  profile_id_(profile_id)
+		: profile_id_(profile_id)
 	{
-		if(!stop_event_.valid())
+		const HANDLE raw_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if(raw_stop_event == nullptr)
 		{
-			throw_last_error("CreateEventW");
+			const DWORD error = GetLastError();
+			throw_win32_error(error, "CreateEventW");
 		}
+		stop_event_ = UniqueHandle(raw_stop_event);
 	}
 
 	/// Serves sequential trusted clients until shutdown is signaled.
@@ -355,14 +407,29 @@ public:
 	{
 		try
 		{
-			const PipeSecurity security = current_user_pipe_security();
-			while(WaitForSingleObject(stop_event_.get(), 0U) == WAIT_TIMEOUT)
+			auto descriptor = detail::build_pipe_security_descriptor();
+			SECURITY_ATTRIBUTES security {
+				.nLength = sizeof(SECURITY_ATTRIBUTES),
+				.lpSecurityDescriptor = descriptor.data(),
+				.bInheritHandle = FALSE,
+			};
+			while(true)
 			{
+				const DWORD stop_state = WaitForSingleObject(stop_event_.get(), 0U);
+				if(stop_state == WAIT_OBJECT_0)
+				{
+					return ERROR_SUCCESS;
+				}
+				if(stop_state == WAIT_FAILED)
+				{
+					return GetLastError();
+				}
+
 				const DWORD open_mode =
 					PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE;
 				const DWORD pipe_mode =
 					PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
-				UniqueHandle pipe(CreateNamedPipeW(
+				const HANDLE raw_pipe = CreateNamedPipeW(
 					pipe_name().c_str(),
 					open_mode,
 					pipe_mode,
@@ -372,26 +439,30 @@ public:
 					static_cast<DWORD>(
 						mcd::protocol::header_size + mcd::protocol::maximum_payload_size),
 					0U,
-					const_cast<SECURITY_ATTRIBUTES*>(&security.attributes)));
-				if(!pipe.valid())
+					&security);
+				if(raw_pipe == INVALID_HANDLE_VALUE)
 				{
 					return GetLastError();
 				}
+				UniqueHandle pipe(raw_pipe);
 
 				const IoResult connection = connect_client(pipe.get(), stop_event_.get());
-				if(connection == IoResult::stopped)
+				if(connection.status == IoStatus::stopped)
 				{
 					return ERROR_SUCCESS;
 				}
-				if(connection == IoResult::failed)
+				if(connection.status == IoStatus::failed)
 				{
-					return GetLastError();
+					return connection.error;
 				}
 
 				serve_client(pipe.get());
 				DisconnectNamedPipe(pipe.get());
 			}
-			return ERROR_SUCCESS;
+		}
+		catch(const std::system_error& error)
+		{
+			return static_cast<DWORD>(error.code().value());
 		}
 		catch(...)
 		{
@@ -410,7 +481,8 @@ private:
 	void serve_client(const HANDLE pipe) noexcept
 	{
 		std::vector<std::byte> frame;
-		if(read_frame(pipe, stop_event_.get(), frame) != IoResult::success)
+		const IoResult read_result = read_frame(pipe, stop_event_.get(), frame);
+		if(read_result.status != IoStatus::success)
 		{
 			return;
 		}
@@ -428,7 +500,18 @@ private:
 			.payload = status_payload(profile_id_),
 		};
 		std::vector<std::byte> bytes = mcd::protocol::encode(response);
-		(void)transfer_exact(pipe, bytes, true, stop_event_.get());
+		const IoResult write_result = transfer_exact(pipe, bytes, true, stop_event_.get());
+		if(write_result.status != IoStatus::success)
+		{
+			return;
+		}
+
+		std::byte trailing_byte {};
+		(void)transfer_exact(
+			pipe,
+			std::span<std::byte>(&trailing_byte, 1U),
+			false,
+			stop_event_.get());
 	}
 
 	UniqueHandle stop_event_;
