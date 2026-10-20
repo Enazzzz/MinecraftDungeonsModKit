@@ -14,6 +14,7 @@ include(cmake/compiler_options.cmake)
 
 add_library(mcd-common STATIC
 	src/common/build_identity.cpp
+	src/common/protocol.cpp
 	src/common/sha256_windows.cpp
 )
 target_include_directories(mcd-common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
