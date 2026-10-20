@@ -4,9 +4,9 @@
 
 **Goal:** Build and verify a native launcher and injected runtime DLL that recognize the supported Minecraft Dungeons Steam executable and exchange a versioned status message.
 
-**Architecture:** A C++20 CMake project builds shared utility code, a command-line launcher, a Windows x64 DLL, and focused tests. The launcher verifies the executable, locates the running process, injects the DLL through `LoadLibraryW`, and then connects to a current-user local named pipe. The DLL performs minimal work in `DllMain`, initializes on a worker thread, validates its host build, starts the pipe server, and shuts down cleanly.
+**Architecture:** A C++23 CMake project builds shared utility code, a command-line launcher, a Windows x64 DLL, and focused tests. The launcher verifies the executable, locates the running process, injects the DLL through `LoadLibraryW`, and then connects to a current-user local named pipe. The DLL performs minimal work in `DllMain`, initializes on a worker thread, validates its host build, starts the pipe server, and shuts down cleanly.
 
-**Tech Stack:** C++20, CMake 3.22+, Visual Studio 2022/MSVC, Windows API, BCrypt, CTest
+**Tech Stack:** C++23, CMake 3.22+, Visual Studio 2022/MSVC, Windows API, BCrypt, CTest
 
 ## Global Constraints
 
@@ -73,7 +73,7 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 	message(FATAL_ERROR "MinecraftDungeonsModKit requires Windows x64")
 endif()
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -130,6 +130,7 @@ git commit -m "build: add native runtime project structure"
 
 **Files:**
 - Modify: `CMakeLists.txt`
+- Modify: `cmake/compiler_options.cmake`
 - Modify: `tests/CMakeLists.txt`
 - Create: `include/mcd/sha256.hpp`
 - Create: `include/mcd/build_identity.hpp`
