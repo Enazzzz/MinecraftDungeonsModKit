@@ -525,6 +525,21 @@ void test_cancel_timeout_retains_pending_operation()
 	REQUIRE(failed_cancel.operation_pending);
 }
 
+/// Verifies a signaled but incomplete result retains operation storage.
+void test_signaled_incomplete_result_remains_pending()
+{
+	const auto result = mcd::runtime::detail::resolve_cancellation(
+		FALSE,
+		ERROR_NOT_FOUND,
+		WAIT_OBJECT_0,
+		ERROR_SUCCESS,
+		FALSE,
+		ERROR_IO_INCOMPLETE);
+	REQUIRE(result.status == mcd::runtime::detail::IoStatus::failed);
+	REQUIRE(result.error == ERROR_IO_INCOMPLETE);
+	REQUIRE(result.operation_pending);
+}
+
 /// Runs one named test while reporting its diagnostic boundary.
 void run_test(const std::string_view name, void (*test)())
 {
@@ -561,5 +576,6 @@ int main()
 	run_test("cancel not found resolves completion", &test_cancel_not_found_resolves_completion);
 	run_test("cancel failure preserves error", &test_cancel_failure_preserves_error);
 	run_test("cancel timeout retains pending operation", &test_cancel_timeout_retains_pending_operation);
+	run_test("signaled incomplete result remains pending", &test_signaled_incomplete_result_remains_pending);
 	return 0;
 }

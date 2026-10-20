@@ -99,6 +99,16 @@ using mcd::runtime::detail::IoResult;
 using mcd::runtime::detail::IoStatus;
 using mcd::runtime::detail::io_failure;
 
+/// Returns a failure whose operation storage must remain alive.
+constexpr IoResult pending_io_failure(const DWORD error) noexcept
+{
+	return {
+		.status = IoStatus::failed,
+		.error = error,
+		.operation_pending = true,
+	};
+}
+
 /// Owns every buffer and structure referenced by one pending operation.
 struct PendingOperation
 {
@@ -232,15 +242,20 @@ IoResult await_operation(
 
 	if(wait_result == WAIT_FAILED)
 	{
-		return io_failure(GetLastError());
+		return pending_io_failure(GetLastError());
 	}
 	if(wait_result != WAIT_OBJECT_0 + 1U)
 	{
-		return io_failure(ERROR_GEN_FAILURE);
+		return pending_io_failure(ERROR_GEN_FAILURE);
 	}
 	if(!GetOverlappedResult(pipe, &operation.overlapped, &transferred, FALSE))
 	{
-		return io_failure(GetLastError());
+		const DWORD error = GetLastError();
+		if(error == ERROR_IO_INCOMPLETE)
+		{
+			return pending_io_failure(error);
+		}
+		return io_failure(error);
 	}
 
 	return {.status = IoStatus::success, .error = ERROR_SUCCESS};
@@ -311,7 +326,14 @@ IoResult transfer_exact(
 					&transferred,
 					TRUE))
 		{
-			return io_failure(GetLastError());
+			const DWORD error = GetLastError();
+			if(error == ERROR_IO_INCOMPLETE)
+			{
+				const IoResult result = pending_io_failure(error);
+				quarantine_pending_operation(std::move(operation));
+				return result;
+			}
+			return io_failure(error);
 		}
 
 		if(transferred == 0U)
@@ -441,6 +463,11 @@ IoResult resolve_cancellation(
 			.error = cancellation_failed ? cancel_error : ERROR_GEN_FAILURE,
 			.operation_pending = true,
 		};
+	}
+	if(!completion_succeeded && completion_error == ERROR_IO_INCOMPLETE)
+	{
+		return pending_io_failure(
+			cancellation_failed ? cancel_error : completion_error);
 	}
 	if(cancellation_failed)
 	{

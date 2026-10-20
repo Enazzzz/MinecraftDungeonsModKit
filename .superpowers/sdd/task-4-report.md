@@ -315,3 +315,69 @@ All focused runtime tests passed in each of three consecutive runs. The full Deb
 ### Final Gate Concerns
 
 No active handle, callback, or thread remains after runtime shutdown. In the pathological case where Windows does not resolve a cancelled operation within 500 ms, the operation's heap-only state is intentionally retained until process exit so kernel references can never outlive their storage.
+
+## Final Lifetime Defect Follow-Up
+
+### Correction
+
+- `resolve_cancellation(...)` now marks `WAIT_OBJECT_0` plus `GetOverlappedResult(...)=FALSE` and `ERROR_IO_INCOMPLETE` as `operation_pending=true`, preserving `ERROR_IO_INCOMPLETE`.
+- The ordinary signaled completion path applies the same classification.
+- The immediate-completion verification path also quarantines storage if Windows unexpectedly reports `ERROR_IO_INCOMPLETE`.
+- Initial wait failures and unexpected wait results now retain operation storage because they do not prove kernel completion.
+- Every transfer and connection caller quarantines the heap-owned `PendingOperation` whenever `operation_pending` is true.
+
+The adjacent audit found no other concrete equivalents: initiation failures other than `ERROR_IO_PENDING` do not establish a pending operation, while completed `GetOverlappedResult` failures other than `ERROR_IO_INCOMPLETE` are terminal operation results.
+
+### RED Evidence
+
+Command:
+
+```powershell
+cmake --build build --config Debug --target mcd_runtime_tests
+.\build\tests\Debug\mcd_runtime_tests.exe
+```
+
+Observed result:
+
+```text
+RUN signaled incomplete result remains pending
+FAIL signaled incomplete result remains pending: result.operation_pending
+```
+
+### GREEN Evidence
+
+Commands:
+
+```powershell
+cmake --build build --config Debug --target mcd_runtime_tests
+ctest --test-dir build -C Debug --output-on-failure -R runtime
+```
+
+Observed result:
+
+```text
+1/1 Test #4: runtime ... Passed
+100% tests passed, 0 tests failed out of 1
+```
+
+Commands:
+
+```powershell
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure -R "runtime|protocol"
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+Observed result:
+
+```text
+mcd-runtime.vcxproj -> ...\build\Debug\mcd-runtime.dll
+2/2 tests passed: protocol, runtime
+100% tests passed, 0 tests failed out of 2
+
+1/4 Test #1: smoke ............ Passed
+2/4 Test #2: build_identity ... Passed
+3/4 Test #3: protocol ......... Passed
+4/4 Test #4: runtime .......... Passed
+100% tests passed, 0 tests failed out of 4
+```
