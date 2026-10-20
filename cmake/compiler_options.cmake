@@ -1,6 +1,6 @@
 add_library(mcd_project_options INTERFACE)
 
-target_compile_features(mcd_project_options INTERFACE cxx_std_20)
+target_compile_features(mcd_project_options INTERFACE cxx_std_23)
 
 target_compile_options(mcd_project_options INTERFACE
 	/W4
