@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include <shlobj.h>
 #include <tlhelp32.h>
 
 namespace
@@ -217,6 +218,38 @@ std::expected<void, mcd::launcher::InjectFailure> validate_architecture(
 	return {};
 }
 
+/// Derives a PID-reuse-safe identity from the exact held process handle.
+std::expected<mcd::launcher::detail::TargetIdentity, mcd::launcher::InjectFailure>
+target_identity(const HANDLE target)
+{
+	FILETIME creation {};
+	FILETIME exit {};
+	FILETIME kernel {};
+	FILETIME user {};
+	if(!GetProcessTimes(target, &creation, &exit, &kernel, &user))
+	{
+		return std::unexpected(mcd::launcher::InjectFailure {
+			.error = mcd::launcher::InjectError::process_time_query_failed,
+			.win32_error = GetLastError(),
+		});
+	}
+	const DWORD process_id = GetProcessId(target);
+	if(process_id == 0U)
+	{
+		return std::unexpected(mcd::launcher::InjectFailure {
+			.error = mcd::launcher::InjectError::process_time_query_failed,
+			.win32_error = GetLastError(),
+		});
+	}
+	const std::uint64_t creation_time =
+		(static_cast<std::uint64_t>(creation.dwHighDateTime) << 32U) |
+		creation.dwLowDateTime;
+	return mcd::launcher::detail::TargetIdentity {
+		.process_id = process_id,
+		.creation_time = creation_time,
+	};
+}
+
 /// Returns the mapped size recorded by one trusted local PE image.
 std::expected<std::size_t, DWORD> module_image_size(const HMODULE module) noexcept
 {
@@ -333,6 +366,195 @@ inspect_modules(
 		});
 	}
 	return std::pair {runtime_match, kernel32_base};
+}
+}
+
+namespace mcd::launcher::detail
+{
+/// Records the injection-state directory used by this store.
+InjectionStateStore::InjectionStateStore(std::filesystem::path root)
+	: root_(std::move(root))
+{
+}
+
+/// Resolves the current user's LocalAppData injection-state directory.
+std::expected<InjectionStateStore, InjectFailure> InjectionStateStore::current_user()
+{
+	PWSTR raw_path = nullptr;
+	const HRESULT result = SHGetKnownFolderPath(
+		FOLDERID_LocalAppData,
+		KF_FLAG_CREATE,
+		nullptr,
+		&raw_path);
+	if(FAILED(result))
+	{
+		return std::unexpected(InjectFailure {
+			.error = InjectError::injection_state_root_failed,
+			.win32_error = static_cast<DWORD>(result),
+		});
+	}
+	const std::filesystem::path root =
+		std::filesystem::path(raw_path) /
+		L"MinecraftDungeonsModKit" /
+		L"injection-state";
+	CoTaskMemFree(raw_path);
+	return InjectionStateStore(root);
+}
+
+/// Returns the versioned marker path for one PID/creation-time identity.
+std::filesystem::path InjectionStateStore::marker_path(
+	const TargetIdentity& identity) const
+{
+	return root_ /
+		(L"v1-" + std::to_wstring(identity.process_id) + L"-" +
+		 std::to_wstring(identity.creation_time) + L".state");
+}
+
+/// Returns whether one identity has retained uncertain loader state.
+std::expected<bool, InjectFailure> InjectionStateStore::exists(
+	const TargetIdentity& identity) const
+{
+	const DWORD attributes = GetFileAttributesW(marker_path(identity).c_str());
+	if(attributes != INVALID_FILE_ATTRIBUTES)
+	{
+		return true;
+	}
+	const DWORD error = GetLastError();
+	if(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+	{
+		return false;
+	}
+	return std::unexpected(InjectFailure {
+		.error = InjectError::injection_state_query_failed,
+		.win32_error = error,
+	});
+}
+
+/// Atomically creates and durably writes one in-progress identity marker.
+std::expected<void, InjectFailure> InjectionStateStore::create(
+	const TargetIdentity& identity) const
+{
+	std::error_code directory_error;
+	std::filesystem::create_directories(root_, directory_error);
+	if(directory_error)
+	{
+		return std::unexpected(InjectFailure {
+			.error = InjectError::injection_state_root_failed,
+			.win32_error = static_cast<DWORD>(directory_error.value()),
+		});
+	}
+
+	const auto path = marker_path(identity);
+	const HANDLE file = CreateFileW(
+		path.c_str(),
+		GENERIC_WRITE,
+		FILE_SHARE_READ,
+		nullptr,
+		CREATE_NEW,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+		nullptr);
+	if(file == INVALID_HANDLE_VALUE)
+	{
+		const DWORD error = GetLastError();
+		return std::unexpected(InjectFailure {
+			.error = error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS
+				? InjectError::injection_state_uncertain
+				: InjectError::injection_state_create_failed,
+			.win32_error = error,
+		});
+	}
+
+	// Version 1 is UTF-8-compatible ASCII:
+	// magic, PID, process creation FILETIME ticks, and fail-closed state.
+	const std::string content =
+		"MCD_INJECTION_STATE_V1\npid=" + std::to_string(identity.process_id) +
+		"\ncreation_time_100ns=" + std::to_string(identity.creation_time) +
+		"\nstate=loader_started_or_uncertain\n";
+	DWORD written = 0U;
+	const BOOL write_succeeded = WriteFile(
+		file,
+		content.data(),
+		static_cast<DWORD>(content.size()),
+		&written,
+		nullptr);
+	DWORD error = write_succeeded ? ERROR_SUCCESS : GetLastError();
+	if(write_succeeded && written == content.size() && !FlushFileBuffers(file))
+	{
+		error = GetLastError();
+	}
+	const BOOL close_succeeded = CloseHandle(file);
+	if(error == ERROR_SUCCESS && !close_succeeded)
+	{
+		error = GetLastError();
+	}
+	if(error != ERROR_SUCCESS || written != content.size())
+	{
+		DeleteFileW(path.c_str());
+		return std::unexpected(InjectFailure {
+			.error = InjectError::injection_state_write_failed,
+			.win32_error = error == ERROR_SUCCESS ? ERROR_WRITE_FAULT : error,
+		});
+	}
+	return {};
+}
+
+/// Removes one marker after loader completion is definitive.
+std::expected<void, InjectFailure> InjectionStateStore::clear(
+	const TargetIdentity& identity) const
+{
+	if(DeleteFileW(marker_path(identity).c_str()))
+	{
+		return {};
+	}
+	const DWORD error = GetLastError();
+	if(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+	{
+		return {};
+	}
+	return std::unexpected(InjectFailure {
+		.error = InjectError::injection_state_cleanup_failed,
+		.win32_error = error,
+	});
+}
+
+/// Reconciles persisted state with the currently observed module set.
+std::expected<InjectionStateDecision, InjectFailure> evaluate_injection_state(
+	const InjectionStateStore& store,
+	const TargetIdentity& identity,
+	const ModuleMatch module_match)
+{
+	if(module_match == ModuleMatch::ambiguous)
+	{
+		return std::unexpected(InjectFailure {
+			.error = InjectError::module_ambiguous,
+			.win32_error = ERROR_DUP_NAME,
+		});
+	}
+	const auto marker_exists = store.exists(identity);
+	if(!marker_exists)
+	{
+		return std::unexpected(marker_exists.error());
+	}
+	if(module_match == ModuleMatch::exact)
+	{
+		if(*marker_exists)
+		{
+			const auto cleared = store.clear(identity);
+			if(!cleared)
+			{
+				return std::unexpected(cleared.error());
+			}
+		}
+		return InjectionStateDecision::already_loaded;
+	}
+	if(*marker_exists)
+	{
+		return std::unexpected(InjectFailure {
+			.error = InjectError::injection_state_uncertain,
+			.win32_error = ERROR_BUSY,
+		});
+	}
+	return InjectionStateDecision::proceed;
 }
 }
 
@@ -591,19 +813,31 @@ std::expected<InjectionResult, InjectFailure> inject_runtime(
 		return std::unexpected(injection_lock.error());
 	}
 
+	const auto identity = target_identity(target.get());
+	if(!identity)
+	{
+		return std::unexpected(identity.error());
+	}
+
 	const auto modules = inspect_modules(target.get(), *validated_runtime);
 	if(!modules)
 	{
 		return std::unexpected(modules.error());
 	}
-	if(modules->first == ModuleMatch::ambiguous)
+	const auto state_store = detail::InjectionStateStore::current_user();
+	if(!state_store)
 	{
-		return std::unexpected(InjectFailure {
-			.error = InjectError::module_ambiguous,
-			.win32_error = ERROR_DUP_NAME,
-		});
+		return std::unexpected(state_store.error());
 	}
-	if(modules->first == ModuleMatch::exact)
+	const auto state = detail::evaluate_injection_state(
+		*state_store,
+		*identity,
+		modules->first);
+	if(!state)
+	{
+		return std::unexpected(state.error());
+	}
+	if(*state == detail::InjectionStateDecision::already_loaded)
 	{
 		return InjectionResult::already_loaded;
 	}
@@ -686,6 +920,30 @@ std::expected<InjectionResult, InjectFailure> inject_runtime(
 		}));
 	}
 
+	const auto marker_created = state_store->create(*identity);
+	if(!marker_created)
+	{
+		return std::unexpected(release_before_failure(marker_created.error()));
+	}
+	const auto definitive_failure =
+		[&remote_path, &state_store, &identity](
+			const InjectFailure failure) noexcept {
+			const DWORD release_error = remote_path.release();
+			const auto marker_cleared = state_store->clear(*identity);
+			if(!marker_cleared)
+			{
+				return marker_cleared.error();
+			}
+			if(release_error != ERROR_SUCCESS)
+			{
+				return InjectFailure {
+					.error = InjectError::remote_memory_release_failed,
+					.win32_error = release_error,
+				};
+			}
+			return failure;
+		};
+
 	const auto thread_entry =
 		reinterpret_cast<LPTHREAD_START_ROUTINE>(*remote_loader);
 	UniqueHandle thread(CreateRemoteThread(
@@ -698,7 +956,7 @@ std::expected<InjectionResult, InjectFailure> inject_runtime(
 		nullptr));
 	if(!thread.valid())
 	{
-		return std::unexpected(release_before_failure(InjectFailure {
+		return std::unexpected(definitive_failure(InjectFailure {
 			.error = InjectError::remote_thread_failed,
 			.win32_error = GetLastError(),
 		}));
@@ -728,20 +986,25 @@ std::expected<InjectionResult, InjectFailure> inject_runtime(
 	DWORD load_result = 0U;
 	if(!GetExitCodeThread(thread.get(), &load_result))
 	{
-		return std::unexpected(release_before_failure(InjectFailure {
+		return std::unexpected(definitive_failure(InjectFailure {
 			.error = InjectError::remote_thread_wait_failed,
 			.win32_error = GetLastError(),
 		}));
 	}
 	if(load_result == 0U)
 	{
-		return std::unexpected(release_before_failure(InjectFailure {
+		return std::unexpected(definitive_failure(InjectFailure {
 			.error = InjectError::remote_load_failed,
 			.win32_error = ERROR_DLL_INIT_FAILED,
 		}));
 	}
 
 	const DWORD release_error = remote_path.release();
+	const auto marker_cleared = state_store->clear(*identity);
+	if(!marker_cleared)
+	{
+		return std::unexpected(marker_cleared.error());
+	}
 	if(release_error != ERROR_SUCCESS)
 	{
 		return std::unexpected(InjectFailure {
@@ -769,6 +1032,8 @@ std::string inject_error_message(const InjectFailure& failure)
 		return "running process image differs from inspected executable";
 	case InjectError::process_open_failed:
 		return "opening target process failed";
+	case InjectError::process_time_query_failed:
+		return "target process creation time query failed";
 	case InjectError::architecture_query_failed:
 		return "target architecture query failed";
 	case InjectError::architecture_mismatch:
@@ -783,6 +1048,18 @@ std::string inject_error_message(const InjectFailure& failure)
 		return "target module enumeration failed";
 	case InjectError::module_ambiguous:
 		return "same-named runtime module has a different path";
+	case InjectError::injection_state_root_failed:
+		return "injection state directory resolution failed";
+	case InjectError::injection_state_query_failed:
+		return "injection state marker query failed";
+	case InjectError::injection_state_create_failed:
+		return "injection state marker creation failed";
+	case InjectError::injection_state_write_failed:
+		return "injection state marker write failed";
+	case InjectError::injection_state_cleanup_failed:
+		return "injection state marker cleanup failed";
+	case InjectError::injection_state_uncertain:
+		return "prior injection outcome remains uncertain";
 	case InjectError::loader_resolution_failed:
 		return "LoadLibraryW resolution failed";
 	case InjectError::invalid_loader_address:

@@ -224,3 +224,87 @@ Responding=True
 ```
 
 No reinjection occurred after the duplicate result. The game remained visibly responsive and was closed normally with `Alt+F4`.
+
+## Persistent Timeout-State Fix
+
+### Marker format and lifecycle
+
+The launcher now derives a target identity under the held per-target mutex by calling `GetProcessTimes` and combining:
+
+```text
+process ID + process creation FILETIME ticks
+```
+
+The marker path is current-user-local and versioned:
+
+```text
+%LocalAppData%\MinecraftDungeonsModKit\injection-state\
+	v1-<pid>-<creation_time_100ns>.state
+```
+
+The marker payload is ASCII:
+
+```text
+MCD_INJECTION_STATE_V1
+pid=<decimal DWORD>
+creation_time_100ns=<decimal uint64>
+state=loader_started_or_uncertain
+```
+
+`CREATE_NEW` provides atomic marker existence. The complete payload is written and flushed with write-through semantics before `CreateRemoteThread`; creation, write, flush, or close failure aborts before a loader starts. A PID reused by a newer process maps to a different creation-time marker.
+
+Lifecycle:
+
+1. Under the PID/build mutex, inspect modules first.
+2. If the exact canonical runtime is loaded, remove any matching marker and return already-loaded success.
+3. If no exact module is loaded and the matching marker exists, return `injection_state_uncertain`; never start another loader.
+4. Otherwise create and flush the marker immediately before `CreateRemoteThread`.
+5. Remove it only after thread creation definitively fails or the loader thread definitively terminates.
+6. Retain it on timeout or any wait outcome where thread completion is uncertain, alongside the existing remote-memory retention.
+
+Old markers for exited targets are harmless and intentionally conservative; creation time prevents them from affecting a new process that reuses the PID.
+
+### TDD evidence
+
+Marker lifecycle tests were added before implementation for:
+
+- fresh identity → proceed → in-progress marker → definitive cleanup;
+- timeout-style retained marker surviving store reconstruction;
+- exact loaded module clearing a retained marker;
+- same PID with a new creation time remaining isolated;
+- retained marker with no demonstrably loaded module returning `injection_state_uncertain`.
+
+RED:
+
+```powershell
+cmake --build build --config Debug --target mcd_launcher_tests
+```
+
+Observed expected compile failures because `InjectionStateStore`, `TargetIdentity`, `InjectionStateDecision`, `evaluate_injection_state`, and `injection_state_uncertain` did not exist.
+
+GREEN and full suite:
+
+```powershell
+cmake --build build --config Debug --target mcd_launcher_tests
+.\build\tests\Debug\mcd_launcher_tests.exe
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+Observed: focused launcher test exit `0`; Debug build exit `0`; final CTest `5/5` passed, `0` failed in `0.56 sec`; launcher suite completed in `0.45 sec`.
+
+### Safe live evidence
+
+The exact executable inspected as profile `steam-2026-10-19`, then the game was launched to the visibly ready offline hero-selection menu. No timeout was forced:
+
+```text
+runtime injected into process 31440
+INJECT_EXIT=0
+{"state":"ready","runtime_version":"0.1.0","profile_id":"steam-2026-10-19","process_id":31440}
+STATUS_EXIT=0
+runtime already loaded into process 31440
+DUPLICATE_EXIT=0
+Responding=True
+```
+
+The successful definitive loader outcome left no `.state` files under the LocalAppData injection-state directory. The game remained responsive and was closed normally with `Alt+F4`.

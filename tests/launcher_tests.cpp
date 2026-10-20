@@ -75,6 +75,44 @@ private:
 	std::filesystem::path path_;
 };
 
+/// Owns a unique temporary root for persistent marker tests.
+class TemporaryMarkerRoot
+{
+public:
+	/// Creates an empty unique marker root path.
+	TemporaryMarkerRoot()
+	{
+		const auto suffix = std::to_wstring(
+			std::chrono::steady_clock::now().time_since_epoch().count());
+		path_ = std::filesystem::temp_directory_path() /
+			(L"mcd-marker-tests-" + suffix);
+		std::error_code error;
+		std::filesystem::remove_all(path_, error);
+	}
+
+	/// Removes all marker-test files without throwing from cleanup.
+	~TemporaryMarkerRoot() noexcept
+	{
+		std::error_code error;
+		std::filesystem::remove_all(path_, error);
+	}
+
+	/// Prevents duplicate ownership of the temporary tree.
+	TemporaryMarkerRoot(const TemporaryMarkerRoot&) = delete;
+
+	/// Prevents duplicate cleanup assignment.
+	TemporaryMarkerRoot& operator=(const TemporaryMarkerRoot&) = delete;
+
+	/// Returns the unique root path.
+	[[nodiscard]] const std::filesystem::path& path() const noexcept
+	{
+		return path_;
+	}
+
+private:
+	std::filesystem::path path_;
+};
+
 /// Verifies that injection rejects a relative runtime path.
 void test_relative_runtime_path_is_rejected()
 {
@@ -343,6 +381,106 @@ void test_injection_lock_serializes_contenders()
 	REQUIRE(!blocked.has_value());
 	REQUIRE(blocked.error().error == mcd::launcher::InjectError::synchronization_timeout);
 }
+
+/// Verifies a fresh identity can enter progress and clean up definitively.
+void test_injection_marker_definitive_lifecycle()
+{
+	const TemporaryMarkerRoot root;
+	mcd::launcher::detail::InjectionStateStore store(root.path());
+	const mcd::launcher::detail::TargetIdentity identity {
+		.process_id = 12345U,
+		.creation_time = 100U,
+	};
+
+	const auto fresh = mcd::launcher::detail::evaluate_injection_state(
+		store,
+		identity,
+		mcd::launcher::ModuleMatch::none);
+	REQUIRE(fresh == mcd::launcher::detail::InjectionStateDecision::proceed);
+	REQUIRE(store.create(identity).has_value());
+	REQUIRE(store.exists(identity).value());
+	REQUIRE(store.clear(identity).has_value());
+	REQUIRE(!store.exists(identity).value());
+}
+
+/// Verifies a timeout-style retained marker survives store reconstruction.
+void test_injection_marker_timeout_is_retained()
+{
+	const TemporaryMarkerRoot root;
+	const mcd::launcher::detail::TargetIdentity identity {
+		.process_id = 12345U,
+		.creation_time = 200U,
+	};
+	{
+		mcd::launcher::detail::InjectionStateStore store(root.path());
+		REQUIRE(store.create(identity).has_value());
+	}
+	mcd::launcher::detail::InjectionStateStore reopened(root.path());
+	REQUIRE(reopened.exists(identity).value());
+}
+
+/// Verifies an exact loaded module clears a retained marker as stale.
+void test_exact_module_clears_injection_marker()
+{
+	const TemporaryMarkerRoot root;
+	mcd::launcher::detail::InjectionStateStore store(root.path());
+	const mcd::launcher::detail::TargetIdentity identity {
+		.process_id = 12345U,
+		.creation_time = 300U,
+	};
+	REQUIRE(store.create(identity).has_value());
+
+	const auto result = mcd::launcher::detail::evaluate_injection_state(
+		store,
+		identity,
+		mcd::launcher::ModuleMatch::exact);
+	REQUIRE(result == mcd::launcher::detail::InjectionStateDecision::already_loaded);
+	REQUIRE(!store.exists(identity).value());
+}
+
+/// Verifies PID reuse receives a distinct creation-time marker identity.
+void test_new_process_creation_time_is_isolated()
+{
+	const TemporaryMarkerRoot root;
+	mcd::launcher::detail::InjectionStateStore store(root.path());
+	const mcd::launcher::detail::TargetIdentity old_identity {
+		.process_id = 12345U,
+		.creation_time = 400U,
+	};
+	const mcd::launcher::detail::TargetIdentity new_identity {
+		.process_id = 12345U,
+		.creation_time = 401U,
+	};
+	REQUIRE(store.create(old_identity).has_value());
+
+	const auto result = mcd::launcher::detail::evaluate_injection_state(
+		store,
+		new_identity,
+		mcd::launcher::ModuleMatch::none);
+	REQUIRE(result == mcd::launcher::detail::InjectionStateDecision::proceed);
+	REQUIRE(store.exists(old_identity).value());
+	REQUIRE(!store.exists(new_identity).value());
+}
+
+/// Verifies uncertainty without an exact module refuses another loader.
+void test_uncertain_marker_refuses_retry()
+{
+	const TemporaryMarkerRoot root;
+	mcd::launcher::detail::InjectionStateStore store(root.path());
+	const mcd::launcher::detail::TargetIdentity identity {
+		.process_id = 12345U,
+		.creation_time = 500U,
+	};
+	REQUIRE(store.create(identity).has_value());
+
+	const auto result = mcd::launcher::detail::evaluate_injection_state(
+		store,
+		identity,
+		mcd::launcher::ModuleMatch::none);
+	REQUIRE(!result.has_value());
+	REQUIRE(result.error().error == mcd::launcher::InjectError::injection_state_uncertain);
+	REQUIRE(store.exists(identity).value());
+}
 }
 
 /// Runs launcher validation and address-derivation regression tests.
@@ -362,5 +500,10 @@ int main()
 	test_pipe_client_accepts_fragmented_response();
 	test_pipe_client_times_out();
 	test_injection_lock_serializes_contenders();
+	test_injection_marker_definitive_lifecycle();
+	test_injection_marker_timeout_is_retained();
+	test_exact_module_clears_injection_marker();
+	test_new_process_creation_time_is_isolated();
+	test_uncertain_marker_refuses_retry();
 	return 0;
 }

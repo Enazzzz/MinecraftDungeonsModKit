@@ -33,7 +33,10 @@ add_library(mcd-launcher-core STATIC
 	src/launcher/process.cpp
 )
 target_include_directories(mcd-launcher-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(mcd-launcher-core PUBLIC mcd_project_options mcd-common)
+target_link_libraries(mcd-launcher-core
+	PUBLIC mcd_project_options mcd-common
+	PRIVATE shell32 ole32
+)
 
 add_executable(mcd-launcher src/launcher/main.cpp)
 add_library(mcd-runtime SHARED src/runtime/dllmain.cpp)
