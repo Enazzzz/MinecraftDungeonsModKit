@@ -70,6 +70,12 @@ public:
 		return handle_;
 	}
 
+	/// Relinquishes ownership without closing a handle still used by the kernel.
+	[[nodiscard]] HANDLE release() noexcept
+	{
+		return std::exchange(handle_, nullptr);
+	}
+
 	/// Returns whether the wrapper owns a usable handle.
 	[[nodiscard]] bool valid() const noexcept
 	{
@@ -113,8 +119,33 @@ constexpr IoResult pending_io_failure(const DWORD error) noexcept
 struct PendingOperation
 {
 	OVERLAPPED overlapped {};
+	UniqueHandle event {};
 	std::vector<std::byte> buffer {};
 };
+
+/// Gives one asynchronous operation its own manual-reset completion event.
+IoResult initialize_operation(PendingOperation& operation) noexcept
+{
+	operation.event = UniqueHandle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+	if(!operation.event.valid())
+	{
+		return io_failure(GetLastError());
+	}
+	operation.overlapped.hEvent = operation.event.get();
+	return {.status = IoStatus::success, .error = ERROR_SUCCESS};
+}
+
+/// Returns whether an I/O failure belongs only to the connected client.
+bool is_client_failure(const DWORD error) noexcept
+{
+	return
+		error == ERROR_BROKEN_PIPE ||
+		error == ERROR_NO_DATA ||
+		error == ERROR_PIPE_NOT_CONNECTED ||
+		error == ERROR_CONNECTION_ABORTED ||
+		error == ERROR_NETNAME_DELETED ||
+		error == ERROR_BUFFER_OVERFLOW;
+}
 
 /// Bounds the time spent resolving one cancellation request.
 inline constexpr DWORD cancellation_resolution_timeout_ms = 500U;
@@ -206,7 +237,7 @@ IoResult await_operation(
 	const HANDLE stop_event,
 	DWORD& transferred)
 {
-	const std::array<HANDLE, 2> handles {stop_event, pipe};
+	const std::array<HANDLE, 2> handles {stop_event, operation.event.get()};
 	const DWORD wait_result = WaitForMultipleObjects(
 		static_cast<DWORD>(handles.size()),
 		handles.data(),
@@ -217,7 +248,9 @@ IoResult await_operation(
 		const BOOL cancel_succeeded = CancelIoEx(pipe, &operation.overlapped);
 		const DWORD cancel_error = cancel_succeeded ? ERROR_SUCCESS : GetLastError();
 		const DWORD completion_wait =
-			WaitForSingleObject(pipe, cancellation_resolution_timeout_ms);
+			WaitForSingleObject(
+				operation.event.get(),
+				cancellation_resolution_timeout_ms);
 		const DWORD wait_error =
 			completion_wait == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
 
@@ -272,6 +305,11 @@ IoResult transfer_exact(
 	while(offset < bytes.size())
 	{
 		auto operation = std::make_unique<PendingOperation>();
+		const IoResult initialized = initialize_operation(*operation);
+		if(initialized.status != IoStatus::success)
+		{
+			return initialized;
+		}
 		const std::size_t remaining = bytes.size() - offset;
 		operation->buffer.resize(remaining);
 		if(writing)
@@ -357,6 +395,11 @@ IoResult transfer_exact(
 IoResult connect_client(const HANDLE pipe, const HANDLE stop_event)
 {
 	auto operation = std::make_unique<PendingOperation>();
+	const IoResult initialized = initialize_operation(*operation);
+	if(initialized.status != IoStatus::success)
+	{
+		return initialized;
+	}
 	if(ConnectNamedPipe(pipe, &operation->overlapped))
 	{
 		return {.status = IoStatus::success, .error = ERROR_SUCCESS};
@@ -558,6 +601,27 @@ public:
 				.lpSecurityDescriptor = descriptor.data(),
 				.bInheritHandle = FALSE,
 			};
+			const DWORD open_mode =
+				PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE;
+			const DWORD pipe_mode =
+				PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+			const HANDLE raw_pipe = CreateNamedPipeW(
+				pipe_name().c_str(),
+				open_mode,
+				pipe_mode,
+				1U,
+				static_cast<DWORD>(
+					mcd::protocol::header_size + mcd::protocol::maximum_payload_size),
+				static_cast<DWORD>(
+					mcd::protocol::header_size + mcd::protocol::maximum_payload_size),
+				0U,
+				&security);
+			if(raw_pipe == INVALID_HANDLE_VALUE)
+			{
+				return GetLastError();
+			}
+			UniqueHandle pipe(raw_pipe);
+
 			while(true)
 			{
 				const DWORD stop_state = WaitForSingleObject(stop_event_.get(), 0U);
@@ -570,27 +634,6 @@ public:
 					return GetLastError();
 				}
 
-				const DWORD open_mode =
-					PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE;
-				const DWORD pipe_mode =
-					PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
-				const HANDLE raw_pipe = CreateNamedPipeW(
-					pipe_name().c_str(),
-					open_mode,
-					pipe_mode,
-					1U,
-					static_cast<DWORD>(
-						mcd::protocol::header_size + mcd::protocol::maximum_payload_size),
-					static_cast<DWORD>(
-						mcd::protocol::header_size + mcd::protocol::maximum_payload_size),
-					0U,
-					&security);
-				if(raw_pipe == INVALID_HANDLE_VALUE)
-				{
-					return GetLastError();
-				}
-				UniqueHandle pipe(raw_pipe);
-
 				const IoResult connection = connect_client(pipe.get(), stop_event_.get());
 				if(connection.status == IoStatus::stopped)
 				{
@@ -598,11 +641,35 @@ public:
 				}
 				if(connection.status == IoStatus::failed)
 				{
+					if(connection.operation_pending)
+					{
+						(void)pipe.release();
+						return connection.error;
+					}
+					if(is_client_failure(connection.error))
+					{
+						DisconnectNamedPipe(pipe.get());
+						continue;
+					}
 					return connection.error;
 				}
 
-				serve_client(pipe.get());
+				const IoResult session = serve_client(pipe.get());
+				if(session.operation_pending)
+				{
+					(void)pipe.release();
+					return session.error;
+				}
 				DisconnectNamedPipe(pipe.get());
+				if(session.status == IoStatus::stopped)
+				{
+					return ERROR_SUCCESS;
+				}
+				if(session.status == IoStatus::failed &&
+				   !is_client_failure(session.error))
+				{
+					return session.error;
+				}
 			}
 		}
 		catch(const std::system_error& error)
@@ -623,13 +690,13 @@ public:
 
 private:
 	/// Handles at most one status request for the connected client.
-	void serve_client(const HANDLE pipe) noexcept
+	[[nodiscard]] IoResult serve_client(const HANDLE pipe) noexcept
 	{
 		std::vector<std::byte> frame;
 		const IoResult read_result = read_frame(pipe, stop_event_.get(), frame);
 		if(read_result.status != IoStatus::success)
 		{
-			return;
+			return read_result;
 		}
 
 		const auto request = mcd::protocol::decode(frame);
@@ -637,7 +704,7 @@ private:
 		   request->kind != mcd::protocol::MessageKind::status_request ||
 		   !request->payload.empty())
 		{
-			return;
+			return {.status = IoStatus::success, .error = ERROR_SUCCESS};
 		}
 
 		const mcd::protocol::Message response {
@@ -648,11 +715,11 @@ private:
 		const IoResult write_result = transfer_exact(pipe, bytes, true, stop_event_.get());
 		if(write_result.status != IoStatus::success)
 		{
-			return;
+			return write_result;
 		}
 
 		std::byte trailing_byte {};
-		(void)transfer_exact(
+		return transfer_exact(
 			pipe,
 			std::span<std::byte>(&trailing_byte, 1U),
 			false,

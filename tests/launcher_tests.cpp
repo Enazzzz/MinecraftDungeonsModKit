@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -308,7 +309,7 @@ HANDLE create_test_pipe(const DWORD process_id)
 /// Verifies the launcher client assembles a response split across partial reads.
 void test_pipe_client_accepts_fragmented_response()
 {
-	constexpr DWORD process_id = 4'000'000'001U;
+	const DWORD process_id = GetCurrentProcessId();
 	const HANDLE pipe = create_test_pipe(process_id);
 	REQUIRE(pipe != INVALID_HANDLE_VALUE);
 	auto server = std::async(std::launch::async, [pipe] {
@@ -343,7 +344,7 @@ void test_pipe_client_accepts_fragmented_response()
 /// Verifies the launcher client returns after its bounded response deadline.
 void test_pipe_client_times_out()
 {
-	constexpr DWORD process_id = 4'000'000'002U;
+	const DWORD process_id = GetCurrentProcessId();
 	const HANDLE pipe = create_test_pipe(process_id);
 	REQUIRE(pipe != INVALID_HANDLE_VALUE);
 	auto server = std::async(std::launch::async, [pipe] {
@@ -360,6 +361,14 @@ void test_pipe_client_times_out()
 	REQUIRE(result.error().error == mcd::launcher::PipeClientError::timeout);
 	REQUIRE(elapsed < std::chrono::seconds(1));
 	server.get();
+}
+
+/// Verifies an impostor PID cannot satisfy exact pipe-server authentication.
+void test_pipe_client_rejects_server_pid_mismatch()
+{
+	REQUIRE(mcd::launcher::detail::server_process_matches(123U, 123U));
+	REQUIRE(!mcd::launcher::detail::server_process_matches(123U, 124U));
+	REQUIRE(!mcd::launcher::detail::server_process_matches(0U, 0U));
 }
 
 /// Verifies two launcher contenders cannot enter one target critical section.
@@ -481,29 +490,41 @@ void test_uncertain_marker_refuses_retry()
 	REQUIRE(result.error().error == mcd::launcher::InjectError::injection_state_uncertain);
 	REQUIRE(store.exists(identity).value());
 }
+
+/// Runs one named test while reporting its diagnostic boundary.
+void run_test(const std::string_view name, void (*test)())
+{
+	std::cout << "RUN " << name << '\n';
+	test();
+	std::cout << "PASS " << name << '\n';
+}
 }
 
 /// Runs launcher validation and address-derivation regression tests.
 int main()
 {
-	test_relative_runtime_path_is_rejected();
-	test_missing_runtime_is_rejected();
-	test_existing_runtime_is_canonicalized();
-	test_mismatched_process_image_is_rejected();
-	test_process_image_comparison_is_case_insensitive();
-	test_process_id_parser_is_strict();
-	test_architecture_compatibility_decisions();
-	test_module_duplicate_classification();
-	test_remote_export_address_uses_module_rva();
-	test_invalid_local_export_address_is_rejected();
-	test_out_of_range_local_export_is_rejected();
-	test_pipe_client_accepts_fragmented_response();
-	test_pipe_client_times_out();
-	test_injection_lock_serializes_contenders();
-	test_injection_marker_definitive_lifecycle();
-	test_injection_marker_timeout_is_retained();
-	test_exact_module_clears_injection_marker();
-	test_new_process_creation_time_is_isolated();
-	test_uncertain_marker_refuses_retry();
+	std::cout << std::unitbuf;
+	run_test("relative runtime path is rejected", &test_relative_runtime_path_is_rejected);
+	run_test("missing runtime is rejected", &test_missing_runtime_is_rejected);
+	run_test("existing runtime is canonicalized", &test_existing_runtime_is_canonicalized);
+	run_test("mismatched process image is rejected", &test_mismatched_process_image_is_rejected);
+	run_test(
+		"process image comparison is case insensitive",
+		&test_process_image_comparison_is_case_insensitive);
+	run_test("process ID parser is strict", &test_process_id_parser_is_strict);
+	run_test("architecture compatibility decisions", &test_architecture_compatibility_decisions);
+	run_test("module duplicate classification", &test_module_duplicate_classification);
+	run_test("remote export address uses module RVA", &test_remote_export_address_uses_module_rva);
+	run_test("invalid local export is rejected", &test_invalid_local_export_address_is_rejected);
+	run_test("out of range local export is rejected", &test_out_of_range_local_export_is_rejected);
+	run_test("pipe client accepts fragmented response", &test_pipe_client_accepts_fragmented_response);
+	run_test("pipe client times out", &test_pipe_client_times_out);
+	run_test("pipe client rejects server PID mismatch", &test_pipe_client_rejects_server_pid_mismatch);
+	run_test("injection lock serializes contenders", &test_injection_lock_serializes_contenders);
+	run_test("injection marker definitive lifecycle", &test_injection_marker_definitive_lifecycle);
+	run_test("injection marker timeout is retained", &test_injection_marker_timeout_is_retained);
+	run_test("exact module clears injection marker", &test_exact_module_clears_injection_marker);
+	run_test("new process creation time is isolated", &test_new_process_creation_time_is_isolated);
+	run_test("uncertain marker refuses retry", &test_uncertain_marker_refuses_retry);
 	return 0;
 }

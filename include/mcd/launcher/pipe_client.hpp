@@ -12,6 +12,7 @@ enum class PipeClientError
 {
 	invalid_process_id,
 	open_failed,
+	server_identity_mismatch,
 	request_failed,
 	timeout,
 	response_failed,
@@ -28,6 +29,11 @@ struct PipeClientFailure
 
 namespace detail
 {
+/// Returns whether a connected pipe server is the exact requested process.
+[[nodiscard]] bool server_process_matches(
+	DWORD requested_process_id,
+	DWORD server_process_id) noexcept;
+
 /// Queries one runtime pipe with a caller-supplied bounded timeout.
 [[nodiscard]] std::expected<std::string, PipeClientFailure> query_status(
 	DWORD process_id,

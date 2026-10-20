@@ -226,6 +226,15 @@ namespace mcd::launcher
 {
 namespace detail
 {
+/// Returns whether a connected pipe server is the exact requested process.
+bool server_process_matches(
+	const DWORD requested_process_id,
+	const DWORD server_process_id) noexcept
+{
+	return requested_process_id != 0U &&
+		server_process_id == requested_process_id;
+}
+
 /// Queries one runtime pipe with a caller-supplied bounded timeout.
 std::expected<std::string, PipeClientFailure> query_status(
 	const DWORD process_id,
@@ -258,13 +267,31 @@ std::expected<std::string, PipeClientFailure> query_status(
 		0U,
 		nullptr,
 		OPEN_EXISTING,
-		FILE_FLAG_OVERLAPPED,
+		FILE_FLAG_OVERLAPPED |
+			SECURITY_SQOS_PRESENT |
+			SECURITY_IDENTIFICATION,
 		nullptr));
 	if(!pipe.valid())
 	{
 		return std::unexpected(PipeClientFailure {
 			.error = PipeClientError::open_failed,
 			.win32_error = GetLastError(),
+		});
+	}
+
+	DWORD server_process_id = 0U;
+	if(!GetNamedPipeServerProcessId(pipe.get(), &server_process_id))
+	{
+		return std::unexpected(PipeClientFailure {
+			.error = PipeClientError::server_identity_mismatch,
+			.win32_error = GetLastError(),
+		});
+	}
+	if(!server_process_matches(process_id, server_process_id))
+	{
+		return std::unexpected(PipeClientFailure {
+			.error = PipeClientError::server_identity_mismatch,
+			.win32_error = ERROR_ACCESS_DENIED,
 		});
 	}
 
@@ -346,6 +373,8 @@ std::string pipe_error_message(const PipeClientFailure& failure)
 		return "process ID is invalid";
 	case PipeClientError::open_failed:
 		return "runtime status pipe is unavailable";
+	case PipeClientError::server_identity_mismatch:
+		return "runtime status pipe server identity does not match target process";
 	case PipeClientError::request_failed:
 		return "status request write failed";
 	case PipeClientError::timeout:

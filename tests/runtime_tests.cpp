@@ -337,6 +337,37 @@ void test_pipe_server_rejects_malformed_frame()
 	REQUIRE(result.get() == ERROR_SUCCESS);
 }
 
+/// Verifies a malformed disconnected client cannot prevent a later valid session.
+void test_pipe_server_recovers_after_malformed_disconnect()
+{
+	mcd::runtime::PipeServer server("test-profile");
+	auto result = std::async(std::launch::async, [&server] {
+		return server.run();
+	});
+	const auto deadline =
+		std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	const HANDLE malformed_client = connect_client(deadline);
+	const std::byte fragment {'M'};
+	write_all(malformed_client, std::span {&fragment, 1U});
+	CloseHandle(malformed_client);
+
+	const HANDLE valid_client = connect_client(deadline);
+	const auto request = mcd::protocol::encode({
+		.kind = mcd::protocol::MessageKind::status_request,
+		.payload = {},
+	});
+	write_all(valid_client, request);
+	const auto response = mcd::protocol::decode(read_response(valid_client));
+	REQUIRE(response.has_value());
+	REQUIRE(response->kind == mcd::protocol::MessageKind::status_response);
+	REQUIRE(!response->payload.empty());
+
+	CloseHandle(valid_client);
+	server.request_stop();
+	REQUIRE(result.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+	REQUIRE(result.get() == ERROR_SUCCESS);
+}
+
 /// Verifies oversized framing is rejected before a payload is read.
 void test_pipe_server_rejects_oversized_frame()
 {
@@ -568,6 +599,9 @@ int main()
 	run_test("pipe server stops while waiting", &test_pipe_server_stops_while_waiting);
 	run_test("pipe server accepts fragmented request", &test_pipe_server_accepts_fragmented_request);
 	run_test("pipe server rejects malformed frame", &test_pipe_server_rejects_malformed_frame);
+	run_test(
+		"pipe server recovers after malformed disconnect",
+		&test_pipe_server_recovers_after_malformed_disconnect);
 	run_test("pipe server rejects oversized frame", &test_pipe_server_rejects_oversized_frame);
 	run_test("pipe server stops while connected", &test_pipe_server_stops_while_connected);
 	run_test("pipe security targets logon SID", &test_pipe_security_targets_logon_sid);

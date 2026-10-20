@@ -991,6 +991,10 @@ std::expected<InjectionResult, InjectFailure> inject_runtime(
 			.win32_error = GetLastError(),
 		}));
 	}
+	// A remote thread exposes only a DWORD exit code, so a 64-bit HMODULE is
+	// necessarily truncated here. LoadLibraryW still provides the required
+	// contract: zero means failure and any nonzero value means success. Do not
+	// attempt to reconstruct or otherwise use the module handle from this value.
 	if(load_result == 0U)
 	{
 		return std::unexpected(definitive_failure(InjectFailure {
