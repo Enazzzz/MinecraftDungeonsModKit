@@ -1,0 +1,6 @@
+build/
+.worktrees/
+.superpowers/
+*.user
+*.suo
+*.VC.db
