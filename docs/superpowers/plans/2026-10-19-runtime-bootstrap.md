@@ -53,11 +53,13 @@
 - Create: `CMakeLists.txt`
 - Create: `cmake/compiler_options.cmake`
 - Create: `tests/CMakeLists.txt`
-- Create: `.gitignore`
+- Create: `src/launcher/main.cpp`
+- Create: `src/runtime/dllmain.cpp`
+- Create: `tests/smoke_tests.cpp`
 
 **Interfaces:**
 - Consumes: Visual Studio 2022 and CMake 3.22 or newer.
-- Produces: `mcd_common`, `mcd-launcher`, `mcd-runtime`, `mcd_tests`, and `mcd_project_options`.
+- Produces: `mcd-launcher`, `mcd-runtime`, `mcd_tests`, and `mcd_project_options`.
 
 - [ ] **Step 1: Write the initial build definitions**
 
@@ -76,33 +78,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(cmake/compiler_options.cmake)
-add_library(mcd_common STATIC
-	src/common/build_identity.cpp
-	src/common/protocol.cpp
-	src/common/sha256_windows.cpp
-)
-target_include_directories(mcd_common PUBLIC include)
-target_link_libraries(mcd_common PUBLIC mcd_project_options bcrypt)
-
-add_library(mcd_launcher_core STATIC
-	src/launcher/injector.cpp
-	src/launcher/pipe_client.cpp
-	src/launcher/process.cpp
-)
-target_link_libraries(mcd_launcher_core PUBLIC mcd_common)
-
 add_executable(mcd-launcher src/launcher/main.cpp)
-target_link_libraries(mcd-launcher PRIVATE mcd_launcher_core)
-
-add_library(mcd_runtime_core STATIC
-	src/runtime/pipe_server.cpp
-	src/runtime/runtime.cpp
-)
-target_link_libraries(mcd_runtime_core PUBLIC mcd_common)
-
 add_library(mcd-runtime SHARED src/runtime/dllmain.cpp)
-target_link_libraries(mcd-runtime PRIVATE mcd_runtime_core)
 set_target_properties(mcd-runtime PROPERTIES PREFIX "")
+
+target_link_libraries(mcd-launcher PRIVATE mcd_project_options)
+target_link_libraries(mcd-runtime PRIVATE mcd_project_options)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -110,7 +91,7 @@ if(BUILD_TESTING)
 endif()
 ```
 
-Create the warnings target with `/W4`, `/permissive-`, `/EHsc`, `/utf-8`, `WIN32_LEAN_AND_MEAN`, `NOMINMAX`, and `_WIN32_WINNT=0x0A00`.
+Create the warnings target with `/W4`, `/permissive-`, `/EHsc`, `/utf-8`, `WIN32_LEAN_AND_MEAN`, `NOMINMAX`, and `_WIN32_WINNT=0x0A00`. Add a launcher entry point that prints `mcd-launcher 0.1.0`, a DLL entry point that only disables thread callbacks, and a smoke test that returns success after asserting `sizeof(void*) == 8`.
 
 - [ ] **Step 2: Configure the project**
 
@@ -122,7 +103,7 @@ cmake -S . -B build -A x64 -DBUILD_TESTING=ON
 
 Expected: configuration succeeds and generates `build/MinecraftDungeonsModKit.sln`.
 
-- [ ] **Step 3: Build the empty target graph to expose missing files**
+- [ ] **Step 3: Build and run the smoke test**
 
 Run:
 
@@ -130,18 +111,26 @@ Run:
 cmake --build build --config Debug
 ```
 
-Expected: failure lists source files that Tasks 2–5 create; CMake syntax itself succeeds.
+Run:
+
+```powershell
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+Expected: the build succeeds and the smoke test passes.
 
 - [ ] **Step 4: Commit**
 
 ```powershell
-git add CMakeLists.txt cmake/compiler_options.cmake tests/CMakeLists.txt .gitignore
+git add CMakeLists.txt cmake/compiler_options.cmake src/launcher/main.cpp src/runtime/dllmain.cpp tests
 git commit -m "build: add native runtime project structure"
 ```
 
 ### Task 2: Exact Build Identity
 
 **Files:**
+- Modify: `CMakeLists.txt`
+- Modify: `tests/CMakeLists.txt`
 - Create: `include/mcd/sha256.hpp`
 - Create: `include/mcd/build_identity.hpp`
 - Create: `src/common/sha256_windows.cpp`
@@ -229,6 +218,8 @@ git commit -m "feat: recognize the supported game build"
 ### Task 3: Bounded Control Protocol
 
 **Files:**
+- Modify: `CMakeLists.txt`
+- Modify: `tests/CMakeLists.txt`
 - Create: `include/mcd/wire.hpp`
 - Create: `include/mcd/protocol.hpp`
 - Create: `src/common/protocol.cpp`
@@ -303,7 +294,9 @@ git commit -m "feat: add bounded runtime control protocol"
 ### Task 4: Runtime Lifecycle and Pipe Server
 
 **Files:**
-- Create: `src/runtime/dllmain.cpp`
+- Modify: `CMakeLists.txt`
+- Modify: `tests/CMakeLists.txt`
+- Modify: `src/runtime/dllmain.cpp`
 - Create: `include/mcd/runtime/runtime.hpp`
 - Create: `src/runtime/runtime.cpp`
 - Create: `include/mcd/runtime/pipe_server.hpp`
@@ -383,13 +376,15 @@ git commit -m "feat: add validated runtime lifecycle"
 ### Task 5: Process Discovery, Injection, and Status CLI
 
 **Files:**
+- Modify: `CMakeLists.txt`
+- Modify: `tests/CMakeLists.txt`
 - Create: `include/mcd/launcher/process.hpp`
 - Create: `src/launcher/process.cpp`
 - Create: `include/mcd/launcher/injector.hpp`
 - Create: `src/launcher/injector.cpp`
 - Create: `include/mcd/launcher/pipe_client.hpp`
 - Create: `src/launcher/pipe_client.cpp`
-- Create: `src/launcher/main.cpp`
+- Modify: `src/launcher/main.cpp`
 
 **Interfaces:**
 - Consumes: `inspect <game-exe>`, `inject <game-exe> <runtime-dll>`, and `status <pid>`.
