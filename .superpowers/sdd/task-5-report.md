@@ -1,0 +1,144 @@
+# Task 5 Report: Process Discovery, Injection, and Status CLI
+
+## Result
+
+Implemented the first launcher vertical slice:
+
+- `inspect <game-exe>` canonicalizes and hashes the exact file, prints its byte size, uppercase SHA-256, and selected build profile.
+- `inject <game-exe> <runtime-dll>` rejects unsupported builds and invalid DLL paths before process access, finds exactly one canonical process image match, avoids duplicate loads, and injects through remote `LoadLibraryW`.
+- `status <pid>` performs a bounded request against the process-specific current-user runtime pipe, validates protocol framing, and prints the JSON payload.
+- Stable exit codes distinguish usage (`2`), file validation (`3`), unsupported builds (`4`), discovery (`5`), injection (`6`), and status (`7`) failures.
+
+## Security and Correctness Boundaries
+
+- Process discovery uses `CreateToolhelp32Snapshot` and queries candidate paths with only `PROCESS_QUERY_LIMITED_INFORMATION`.
+- Process selection is filename-prefiltered but accepted only after canonical full-path comparison. Zero or multiple canonical matches fail closed.
+- Runtime DLL validation requires an absolute, existing regular file and returns its canonical path before any target-process handle is opened.
+- Injection opens only:
+  - `PROCESS_CREATE_THREAD`
+  - `PROCESS_QUERY_LIMITED_INFORMATION`
+  - `PROCESS_VM_OPERATION`
+  - `PROCESS_VM_WRITE`
+  - `PROCESS_VM_READ`
+- Duplicate detection enumerates remote modules before opening the target with injection rights.
+- `LoadLibraryW` is not called through a copied local pointer. The launcher validates the local export lies inside the local `kernel32` image, computes its RVA, checks arithmetic overflow, and applies that RVA to the remote `kernel32` base.
+- Remote allocation and kernel handles use RAII. Completed and failed terminal thread paths explicitly release remote path memory and surface release failures.
+- A 15-second loader-thread timeout is enforced. If completion cannot be proven, the small remote path allocation is deliberately retained because freeing memory that a still-running remote thread may read would create a cross-process use-after-free. Handles are still closed.
+- Pipe operations use overlapped I/O with a shared five-second deadline. Timed-out operations are cancelled; operation storage is retained only if bounded cancellation completion cannot be proven.
+
+## TDD Evidence
+
+### RED 1: Initial launcher validation API
+
+Added launcher tests for:
+
+- relative runtime path rejection;
+- missing absolute runtime rejection;
+- canonicalization of an existing runtime;
+- mismatched process-image rejection;
+- case-insensitive Windows path comparison;
+- remote export RVA derivation;
+- invalid local export address rejection.
+
+Command:
+
+```powershell
+cmake --build build --config Debug --target mcd_tests
+```
+
+Observed expected failure:
+
+```text
+launcher_tests.cpp(8,10): error C1083:
+Cannot open include file: 'mcd/launcher/injector.hpp': No such file or directory
+```
+
+### GREEN 1
+
+Implemented the launcher headers and core sources, then built and ran the focused test:
+
+```powershell
+cmake --build build --config Debug --target mcd_launcher_tests
+.\build\tests\Debug\mcd_launcher_tests.exe
+```
+
+Observed: build exit `0`; focused test exit `0`.
+
+### RED 2: Cross-process export upper bound
+
+Added a regression proving an export at or beyond the local image extent is rejected.
+
+Command:
+
+```powershell
+cmake --build build --config Debug --target mcd_launcher_tests
+```
+
+Observed expected compile failure because `remote_export_address` did not yet accept a module-size boundary.
+
+### GREEN 2
+
+Added PE image-size validation and bounded RVA derivation.
+
+Command:
+
+```powershell
+cmake --build build --config Debug --target mcd_launcher_tests
+.\build\tests\Debug\mcd_launcher_tests.exe
+```
+
+Observed: build exit `0`; focused test exit `0`.
+
+## Automated Verification
+
+Commands:
+
+```powershell
+cmake -S . -B build -A x64 -DBUILD_TESTING=ON
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+.\build\Debug\mcd-launcher.exe inspect "C:\Program Files (x86)\Steam\steamapps\common\MinecraftDungeons\Dungeons\Binaries\Win64\Dungeons-Win64-Shipping.exe"
+```
+
+Results:
+
+- Configure: passed.
+- Debug build: passed.
+- CTest: `5/5` passed, `0` failed.
+- Exact executable inspection:
+  - size: `37814288`;
+  - SHA-256: `6A48471423B41CDCDD4F0322560DCAFAE0F433F3BC30721FAE861564A4F5CC73`;
+  - profile: `steam-2026-10-19`;
+  - exit: `0`.
+
+## Live Integration Evidence
+
+The authorized Steam install was launched without modifying original game files. The offline hero-selection main menu was visibly ready before injection.
+
+Final live run:
+
+```text
+runtime injected into process 28276
+INJECT_EXIT=0
+{"state":"ready","runtime_version":"0.1.0","profile_id":"steam-2026-10-19","process_id":28276}
+STATUS_EXIT=0
+runtime already loaded into process 28276
+DUPLICATE_EXIT=0
+Responding=True
+```
+
+The game remained visibly at the animated main menu and Windows reported it responding after injection and the duplicate-injection check. It was then closed normally with `Alt+F4`.
+
+## Self-Review
+
+- Verified unsupported fingerprint rejection precedes discovery.
+- Verified runtime-path validation precedes discovery and target process access.
+- Moved duplicate-module detection ahead of the injection-rights process open.
+- Hardened module matching so a same-named remote runtime whose path cannot be canonicalized fails closed instead of being ignored.
+- Bounded the local export RVA by the mapped local PE image size and checked remote-address overflow.
+- Preserved pending-operation storage on unresolved timeout/cancellation paths rather than introducing use-after-free.
+- No Unreal hooks, firewall changes, executable modifications, or game-file changes were added.
+
+## Concern
+
+Windows provides no safe general-purpose way to cancel a remote thread blocked inside `LoadLibraryW`. On an unresolved 15-second timeout, freeing the remote path would violate the memory-lifetime boundary. The launcher therefore reports timeout, closes handles, and intentionally leaves only that path allocation in the target process. All confirmed terminal paths free it and report cleanup failures.

@@ -27,11 +27,19 @@ add_library(mcd-runtime-core STATIC
 target_include_directories(mcd-runtime-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(mcd-runtime-core PUBLIC mcd_project_options mcd-common PRIVATE advapi32)
 
+add_library(mcd-launcher-core STATIC
+	src/launcher/injector.cpp
+	src/launcher/pipe_client.cpp
+	src/launcher/process.cpp
+)
+target_include_directories(mcd-launcher-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(mcd-launcher-core PUBLIC mcd_project_options mcd-common)
+
 add_executable(mcd-launcher src/launcher/main.cpp)
 add_library(mcd-runtime SHARED src/runtime/dllmain.cpp)
 set_target_properties(mcd-runtime PROPERTIES PREFIX "")
 
-target_link_libraries(mcd-launcher PRIVATE mcd_project_options mcd-common)
+target_link_libraries(mcd-launcher PRIVATE mcd_project_options mcd-launcher-core)
 target_link_libraries(mcd-runtime PRIVATE mcd_project_options mcd-runtime-core)
 
 include(CTest)
