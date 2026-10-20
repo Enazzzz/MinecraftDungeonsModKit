@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include <windows.h>
 
@@ -18,11 +20,10 @@ enum class ProcessError
 	multiple_matches,
 };
 
-/// Identifies one running process whose canonical image matches the requested file.
+/// Identifies one discovered process candidate by its inherently reusable PID.
 struct ProcessInfo
 {
 	DWORD id;
-	std::filesystem::path image_path;
 };
 
 /// Carries one process failure category and its originating Win32 error.
@@ -39,6 +40,9 @@ struct ProcessFailure
 /// Returns the canonical image path of one process opened for limited query access.
 [[nodiscard]] std::expected<std::filesystem::path, ProcessFailure> process_image_path(
 	DWORD process_id);
+
+/// Parses one nonzero process ID from strict ASCII decimal text.
+[[nodiscard]] std::optional<DWORD> parse_process_id(std::wstring_view text) noexcept;
 
 /// Returns a stable diagnostic name for one process-discovery error.
 [[nodiscard]] std::string process_error_message(const ProcessFailure& failure);

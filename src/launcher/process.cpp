@@ -1,6 +1,7 @@
 #include "mcd/launcher/process.hpp"
 
 #include <cwchar>
+#include <limits>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -173,7 +174,6 @@ std::expected<ProcessInfo, ProcessFailure> find_process(
 		{
 			matches.push_back({
 				.id = entry.th32ProcessID,
-				.image_path = *image,
 			});
 		}
 	}
@@ -202,6 +202,35 @@ std::expected<ProcessInfo, ProcessFailure> find_process(
 		});
 	}
 	return matches.front();
+}
+
+/// Parses one nonzero process ID from strict ASCII decimal text.
+std::optional<DWORD> parse_process_id(const std::wstring_view text) noexcept
+{
+	if(text.empty())
+	{
+		return std::nullopt;
+	}
+
+	std::uint64_t value = 0U;
+	for(const wchar_t character : text)
+	{
+		if(character < L'0' || character > L'9')
+		{
+			return std::nullopt;
+		}
+		const unsigned int digit = static_cast<unsigned int>(character - L'0');
+		if(value > (std::numeric_limits<DWORD>::max() - digit) / 10U)
+		{
+			return std::nullopt;
+		}
+		value = (value * 10U) + digit;
+	}
+	if(value == 0U)
+	{
+		return std::nullopt;
+	}
+	return static_cast<DWORD>(value);
 }
 
 /// Returns a stable diagnostic name for one process-discovery error.

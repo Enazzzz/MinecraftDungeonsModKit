@@ -26,6 +26,14 @@ struct PipeClientFailure
 	DWORD win32_error;
 };
 
+namespace detail
+{
+/// Queries one runtime pipe with a caller-supplied bounded timeout.
+[[nodiscard]] std::expected<std::string, PipeClientFailure> query_status(
+	DWORD process_id,
+	DWORD timeout_ms);
+}
+
 /// Queries one runtime status pipe and returns its validated JSON payload.
 [[nodiscard]] std::expected<std::string, PipeClientFailure> query_status(DWORD process_id);
 

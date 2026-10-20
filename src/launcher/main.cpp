@@ -1,7 +1,5 @@
 #include <array>
-#include <cerrno>
 #include <cstddef>
-#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -116,23 +114,6 @@ void print_inspection(const Inspection& inspection)
 	std::wcout << L'\n';
 }
 
-/// Parses a nonzero decimal process ID without accepting trailing text.
-std::optional<DWORD> parse_process_id(const wchar_t* text)
-{
-	if(!text || *text == L'\0' || *text == L'-')
-	{
-		return std::nullopt;
-	}
-	errno = 0;
-	wchar_t* end = nullptr;
-	const unsigned long value = std::wcstoul(text, &end, 10);
-	if(errno == ERANGE || end == text || *end != L'\0' || value == 0U)
-	{
-		return std::nullopt;
-	}
-	return static_cast<DWORD>(value);
-}
-
 /// Prints the supported command syntax.
 void print_usage()
 {
@@ -196,6 +177,9 @@ ExitCode run_inject(
 	const auto result = mcd::launcher::inject_runtime(
 		*process,
 		inspection->path,
+		std::wstring(
+			inspection->profile->id.begin(),
+			inspection->profile->id.end()),
 		*validated_runtime);
 	if(!result)
 	{
@@ -215,7 +199,7 @@ ExitCode run_inject(
 /// Queries and prints one current-user runtime status response.
 ExitCode run_status(const wchar_t* process_id_text)
 {
-	const auto process_id = parse_process_id(process_id_text);
+	const auto process_id = mcd::launcher::parse_process_id(process_id_text);
 	if(!process_id)
 	{
 		std::wcerr << L"error: process ID must be a nonzero decimal integer\n";

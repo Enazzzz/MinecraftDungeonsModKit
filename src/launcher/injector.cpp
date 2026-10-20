@@ -1,7 +1,9 @@
 #include "mcd/launcher/injector.hpp"
 
 #include <limits>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <tlhelp32.h>
 
@@ -14,6 +16,7 @@ constexpr DWORD injection_access =
 	PROCESS_VM_WRITE |
 	PROCESS_VM_READ;
 constexpr DWORD injection_timeout_ms = 15'000U;
+constexpr DWORD synchronization_timeout_ms = 15'000U;
 
 /// Owns one closeable Windows kernel handle.
 class UniqueHandle
@@ -143,6 +146,77 @@ bool equal_windows_path(
 			   TRUE) == CSTR_EQUAL;
 }
 
+/// Returns one canonical image path from the exact held process handle.
+std::expected<std::filesystem::path, mcd::launcher::InjectFailure> held_process_image_path(
+	const HANDLE process)
+{
+	std::vector<wchar_t> buffer(32'768U);
+	DWORD length = static_cast<DWORD>(buffer.size());
+	if(!QueryFullProcessImageNameW(process, 0U, buffer.data(), &length))
+	{
+		return std::unexpected(mcd::launcher::InjectFailure {
+			.error = mcd::launcher::InjectError::process_image_mismatch,
+			.win32_error = GetLastError(),
+		});
+	}
+
+	std::error_code canonical_error;
+	const auto canonical = std::filesystem::canonical(
+		std::filesystem::path(std::wstring_view(buffer.data(), length)),
+		canonical_error);
+	if(canonical_error)
+	{
+		return std::unexpected(mcd::launcher::InjectFailure {
+			.error = mcd::launcher::InjectError::process_image_mismatch,
+			.win32_error = static_cast<DWORD>(canonical_error.value()),
+		});
+	}
+	return canonical;
+}
+
+/// Verifies the held target has the same effective machine as the launcher.
+std::expected<void, mcd::launcher::InjectFailure> validate_architecture(
+	const HANDLE target)
+{
+	USHORT launcher_process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+	USHORT launcher_native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+	if(!IsWow64Process2(
+		   GetCurrentProcess(),
+		   &launcher_process_machine,
+		   &launcher_native_machine))
+	{
+		return std::unexpected(mcd::launcher::InjectFailure {
+			.error = mcd::launcher::InjectError::architecture_query_failed,
+			.win32_error = GetLastError(),
+		});
+	}
+
+	USHORT target_process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+	USHORT target_native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+	if(!IsWow64Process2(
+		   target,
+		   &target_process_machine,
+		   &target_native_machine))
+	{
+		return std::unexpected(mcd::launcher::InjectFailure {
+			.error = mcd::launcher::InjectError::architecture_query_failed,
+			.win32_error = GetLastError(),
+		});
+	}
+	if(!mcd::launcher::architectures_compatible(
+		   launcher_process_machine,
+		   launcher_native_machine,
+		   target_process_machine,
+		   target_native_machine))
+	{
+		return std::unexpected(mcd::launcher::InjectFailure {
+			.error = mcd::launcher::InjectError::architecture_mismatch,
+			.win32_error = ERROR_BAD_EXE_FORMAT,
+		});
+	}
+	return {};
+}
+
 /// Returns the mapped size recorded by one trusted local PE image.
 std::expected<std::size_t, DWORD> module_image_size(const HMODULE module) noexcept
 {
@@ -185,10 +259,19 @@ std::expected<UniqueHandle, DWORD> module_snapshot(const DWORD process_id)
 }
 
 /// Enumerates modules to detect duplicates and locate remote kernel32.
-std::expected<std::pair<bool, std::uintptr_t>, mcd::launcher::InjectFailure> inspect_modules(
-	const DWORD process_id,
+std::expected<std::pair<mcd::launcher::ModuleMatch, std::uintptr_t>, mcd::launcher::InjectFailure>
+inspect_modules(
+	const HANDLE process,
 	const std::filesystem::path& runtime_path)
 {
+	const DWORD process_id = GetProcessId(process);
+	if(process_id == 0U)
+	{
+		return std::unexpected(mcd::launcher::InjectFailure {
+			.error = mcd::launcher::InjectError::module_snapshot_failed,
+			.win32_error = GetLastError(),
+		});
+	}
 	auto snapshot = module_snapshot(process_id);
 	if(!snapshot)
 	{
@@ -198,7 +281,7 @@ std::expected<std::pair<bool, std::uintptr_t>, mcd::launcher::InjectFailure> ins
 		});
 	}
 
-	bool runtime_loaded = false;
+	mcd::launcher::ModuleMatch runtime_match = mcd::launcher::ModuleMatch::none;
 	std::uintptr_t kernel32_base = 0U;
 	MODULEENTRY32W entry {.dwSize = sizeof(MODULEENTRY32W)};
 	if(!Module32FirstW(snapshot->get(), &entry))
@@ -227,7 +310,9 @@ std::expected<std::pair<bool, std::uintptr_t>, mcd::launcher::InjectFailure> ins
 					.win32_error = static_cast<DWORD>(path_error.value()),
 				});
 			}
-			runtime_loaded = equal_windows_path(module_path, runtime_path);
+			runtime_match = mcd::launcher::merge_module_match(
+				runtime_match,
+				mcd::launcher::classify_runtime_module(runtime_path, module_path));
 		}
 	}
 	while(Module32NextW(snapshot->get(), &entry));
@@ -247,12 +332,93 @@ std::expected<std::pair<bool, std::uintptr_t>, mcd::launcher::InjectFailure> ins
 			.win32_error = ERROR_MOD_NOT_FOUND,
 		});
 	}
-	return std::pair {runtime_loaded, kernel32_base};
+	return std::pair {runtime_match, kernel32_base};
 }
 }
 
 namespace mcd::launcher
 {
+/// Records ownership of one successfully acquired mutex.
+TargetInjectionLock::TargetInjectionLock(const HANDLE mutex) noexcept
+	: mutex_(mutex)
+{
+}
+
+/// Releases the mutex when owned and closes its kernel handle.
+TargetInjectionLock::~TargetInjectionLock() noexcept
+{
+	if(mutex_)
+	{
+		ReleaseMutex(mutex_);
+		CloseHandle(mutex_);
+	}
+}
+
+/// Transfers one mutex acquisition.
+TargetInjectionLock::TargetInjectionLock(TargetInjectionLock&& other) noexcept
+	: mutex_(std::exchange(other.mutex_, nullptr))
+{
+}
+
+/// Replaces this lock with a transferred mutex acquisition.
+TargetInjectionLock& TargetInjectionLock::operator=(TargetInjectionLock&& other) noexcept
+{
+	if(this != &other)
+	{
+		if(mutex_)
+		{
+			ReleaseMutex(mutex_);
+			CloseHandle(mutex_);
+		}
+		mutex_ = std::exchange(other.mutex_, nullptr);
+	}
+	return *this;
+}
+
+/// Acquires the target/build mutex before a bounded deadline.
+std::expected<TargetInjectionLock, InjectFailure> TargetInjectionLock::acquire(
+	const DWORD process_id,
+	const std::wstring_view build_id,
+	const DWORD timeout_ms)
+{
+	std::wstring safe_build;
+	safe_build.reserve(build_id.size());
+	for(const wchar_t character : build_id)
+	{
+		const bool allowed =
+			(character >= L'a' && character <= L'z') ||
+			(character >= L'A' && character <= L'Z') ||
+			(character >= L'0' && character <= L'9') ||
+			character == L'-' ||
+			character == L'_';
+		safe_build.push_back(allowed ? character : L'_');
+	}
+	const std::wstring name =
+		L"Local\\mcd-inject-" + std::to_wstring(process_id) + L"-" + safe_build;
+	const HANDLE mutex = CreateMutexW(nullptr, FALSE, name.c_str());
+	if(!mutex)
+	{
+		return std::unexpected(InjectFailure {
+			.error = InjectError::synchronization_failed,
+			.win32_error = GetLastError(),
+		});
+	}
+
+	const DWORD wait_result = WaitForSingleObject(mutex, timeout_ms);
+	if(wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED)
+	{
+		return TargetInjectionLock(mutex);
+	}
+	const DWORD error = wait_result == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+	CloseHandle(mutex);
+	return std::unexpected(InjectFailure {
+		.error = wait_result == WAIT_TIMEOUT
+			? InjectError::synchronization_timeout
+			: InjectError::synchronization_failed,
+		.win32_error = error,
+	});
+}
+
 /// Validates and canonicalizes an absolute existing runtime DLL path.
 std::expected<std::filesystem::path, InjectError> validate_runtime_path(
 	const std::filesystem::path& runtime_path)
@@ -294,6 +460,60 @@ std::expected<void, InjectError> validate_process_image(
 	return {};
 }
 
+/// Returns whether launcher and target effective machine types match.
+bool architectures_compatible(
+	const USHORT launcher_process_machine,
+	const USHORT launcher_native_machine,
+	const USHORT target_process_machine,
+	const USHORT target_native_machine) noexcept
+{
+	if(launcher_native_machine == IMAGE_FILE_MACHINE_UNKNOWN ||
+	   target_native_machine == IMAGE_FILE_MACHINE_UNKNOWN ||
+	   launcher_native_machine != target_native_machine)
+	{
+		return false;
+	}
+	const USHORT launcher_effective =
+		launcher_process_machine == IMAGE_FILE_MACHINE_UNKNOWN
+		? launcher_native_machine
+		: launcher_process_machine;
+	const USHORT target_effective =
+		target_process_machine == IMAGE_FILE_MACHINE_UNKNOWN
+		? target_native_machine
+		: target_process_machine;
+	return launcher_effective == target_effective;
+}
+
+/// Classifies one canonical module path without forgetting prior matches.
+ModuleMatch classify_runtime_module(
+	const std::filesystem::path& runtime_path,
+	const std::filesystem::path& module_path) noexcept
+{
+	if(_wcsicmp(runtime_path.filename().c_str(), module_path.filename().c_str()) != 0)
+	{
+		return ModuleMatch::none;
+	}
+	return equal_windows_path(runtime_path, module_path)
+		? ModuleMatch::exact
+		: ModuleMatch::ambiguous;
+}
+
+/// Merges one module observation with ambiguity taking precedence.
+ModuleMatch merge_module_match(
+	const ModuleMatch current,
+	const ModuleMatch observed) noexcept
+{
+	if(current == ModuleMatch::ambiguous || observed == ModuleMatch::ambiguous)
+	{
+		return ModuleMatch::ambiguous;
+	}
+	if(current == ModuleMatch::exact || observed == ModuleMatch::exact)
+	{
+		return ModuleMatch::exact;
+	}
+	return ModuleMatch::none;
+}
+
 /// Derives a remote export address from local and remote module bases.
 std::expected<std::uintptr_t, InjectError> remote_export_address(
 	const std::uintptr_t local_module,
@@ -321,6 +541,7 @@ std::expected<std::uintptr_t, InjectError> remote_export_address(
 std::expected<InjectionResult, InjectFailure> inject_runtime(
 	const ProcessInfo& process,
 	const std::filesystem::path& inspected_path,
+	const std::wstring_view build_id,
 	const std::filesystem::path& runtime_path)
 {
 	const auto validated_runtime = validate_runtime_path(runtime_path);
@@ -331,8 +552,22 @@ std::expected<InjectionResult, InjectFailure> inject_runtime(
 			.win32_error = ERROR_INVALID_PARAMETER,
 		});
 	}
+	UniqueHandle target(OpenProcess(injection_access, FALSE, process.id));
+	if(!target.valid())
+	{
+		return std::unexpected(InjectFailure {
+			.error = InjectError::process_open_failed,
+			.win32_error = GetLastError(),
+		});
+	}
+
+	const auto target_path = held_process_image_path(target.get());
+	if(!target_path)
+	{
+		return std::unexpected(target_path.error());
+	}
 	const auto validated_process =
-		validate_process_image(inspected_path, process.image_path);
+		validate_process_image(inspected_path, *target_path);
 	if(!validated_process)
 	{
 		return std::unexpected(InjectFailure {
@@ -341,23 +576,36 @@ std::expected<InjectionResult, InjectFailure> inject_runtime(
 		});
 	}
 
-	const auto modules = inspect_modules(process.id, *validated_runtime);
+	const auto architecture = validate_architecture(target.get());
+	if(!architecture)
+	{
+		return std::unexpected(architecture.error());
+	}
+
+	auto injection_lock = TargetInjectionLock::acquire(
+		GetProcessId(target.get()),
+		build_id,
+		synchronization_timeout_ms);
+	if(!injection_lock)
+	{
+		return std::unexpected(injection_lock.error());
+	}
+
+	const auto modules = inspect_modules(target.get(), *validated_runtime);
 	if(!modules)
 	{
 		return std::unexpected(modules.error());
 	}
-	if(modules->first)
-	{
-		return InjectionResult::already_loaded;
-	}
-
-	UniqueHandle target(OpenProcess(injection_access, FALSE, process.id));
-	if(!target.valid())
+	if(modules->first == ModuleMatch::ambiguous)
 	{
 		return std::unexpected(InjectFailure {
-			.error = InjectError::process_open_failed,
-			.win32_error = GetLastError(),
+			.error = InjectError::module_ambiguous,
+			.win32_error = ERROR_DUP_NAME,
 		});
+	}
+	if(modules->first == ModuleMatch::exact)
+	{
+		return InjectionResult::already_loaded;
 	}
 
 	const HMODULE local_kernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -521,10 +769,20 @@ std::string inject_error_message(const InjectFailure& failure)
 		return "running process image differs from inspected executable";
 	case InjectError::process_open_failed:
 		return "opening target process failed";
+	case InjectError::architecture_query_failed:
+		return "target architecture query failed";
+	case InjectError::architecture_mismatch:
+		return "launcher and target architectures differ";
+	case InjectError::synchronization_failed:
+		return "target injection synchronization failed";
+	case InjectError::synchronization_timeout:
+		return "target injection synchronization timed out";
 	case InjectError::module_snapshot_failed:
 		return "target module snapshot failed";
 	case InjectError::module_query_failed:
 		return "target module enumeration failed";
+	case InjectError::module_ambiguous:
+		return "same-named runtime module has a different path";
 	case InjectError::loader_resolution_failed:
 		return "LoadLibraryW resolution failed";
 	case InjectError::invalid_loader_address:

@@ -133,7 +133,7 @@ The game remained visibly at the animated main menu and Windows reported it resp
 
 - Verified unsupported fingerprint rejection precedes discovery.
 - Verified runtime-path validation precedes discovery and target process access.
-- Moved duplicate-module detection ahead of the injection-rights process open.
+- The review hardening supersedes the initial duplicate-check ordering: one final-access process handle is now opened first and retained through duplicate inspection and injection.
 - Hardened module matching so a same-named remote runtime whose path cannot be canonicalized fails closed instead of being ignored.
 - Bounded the local export RVA by the mapped local PE image size and checked remote-address overflow.
 - Preserved pending-operation storage on unresolved timeout/cancellation paths rather than introducing use-after-free.
@@ -142,3 +142,85 @@ The game remained visibly at the animated main menu and Windows reported it resp
 ## Concern
 
 Windows provides no safe general-purpose way to cancel a remote thread blocked inside `LoadLibraryW`. On an unresolved 15-second timeout, freeing the remote path would violate the memory-lifetime boundary. The launcher therefore reports timeout, closes handles, and intentionally leaves only that path allocation in the target process. All confirmed terminal paths free it and report cleanup failures.
+
+## Blocking Review Fixes
+
+### Production hardening
+
+- Injection now opens the selected PID once with the final least-required access mask before trusting process identity. It queries and canonicalizes the image path from that exact handle, revalidates it against the inspected executable, and holds the handle through architecture checks, synchronization, module inspection, allocation, write, and remote-thread completion.
+- `IsWow64Process2` now identifies launcher and target effective machine types. Unknown or mismatched architecture fails with a specific error before module-RVA derivation.
+- A bounded `Local\mcd-inject-<pid>-<build>` mutex serializes duplicate inspection and injection across launcher processes. The 15-second acquisition wait fails closed.
+- Duplicate classification is monotonic: exact matches remain exact, while any same-basename different-path module makes the result ambiguous. Ambiguity has precedence and is reported explicitly.
+- PID parsing now accepts only nonempty ASCII digits representing values `1..DWORD_MAX`; whitespace, signs, non-ASCII digits, suffixes, zero, and overflow are rejected.
+- Existing least-required process rights, bounded loader waits, and remote-memory retention on uncertain completion remain unchanged.
+
+### TDD evidence
+
+Added focused tests before production changes for:
+
+- strict PID parsing and `DWORD` overflow;
+- native/WOW64 architecture compatibility decisions;
+- exact, absent, and ambiguous module classifications plus monotonic merging;
+- fragmented launcher-client status responses;
+- bounded launcher-client response timeout;
+- two target-lock contenders, proving the second cannot enter while the first owns the critical section.
+
+RED command:
+
+```powershell
+cmake --build build --config Debug --target mcd_launcher_tests
+```
+
+Observed expected compilation failures for the not-yet-created `parse_process_id`, `architectures_compatible`, module classification, bounded client seam, and `TargetInjectionLock` interfaces.
+
+GREEN focused verification:
+
+```powershell
+cmake --build build --config Debug --target mcd_protocol_tests mcd_runtime_tests mcd_launcher_tests
+.\build\tests\Debug\mcd_protocol_tests.exe
+.\build\tests\Debug\mcd_runtime_tests.exe
+.\build\tests\Debug\mcd_launcher_tests.exe
+```
+
+Observed exit `0` for all three focused executables. Runtime output reported every named runtime test as `PASS`.
+
+### Full Debug verification
+
+```powershell
+cmake -S . -B build -A x64 -DBUILD_TESTING=ON
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+Observed: configure and build exit `0`. The final post-review rerun reported CTest `5/5` passed, `0` failed in `0.60 sec`; the launcher suite, including synchronization and bounded pipe timeout, completed in `0.45 sec`. A CLI check also rejected `status +1` with usage exit `2`.
+
+### Review-fix live evidence
+
+Safe inspect:
+
+```text
+size: 37814288
+sha256: 6A48471423B41CDCDD4F0322560DCAFAE0F433F3BC30721FAE861564A4F5CC73
+profile: steam-2026-10-19
+INSPECT_EXIT=0
+```
+
+The game was not running, so one fresh launch and injection were required. At the visibly ready offline hero-selection menu:
+
+```text
+runtime injected into process 30876
+INJECT_EXIT=0
+runtime already loaded into process 30876
+DUPLICATE_EXIT=0
+Responding=True
+```
+
+The status command issued immediately after injection observed the expected startup race (`pipe is unavailable`, exit `7`) while the runtime worker hashed the host. After a five-second bounded wait, the same already-loaded runtime returned:
+
+```text
+{"state":"ready","runtime_version":"0.1.0","profile_id":"steam-2026-10-19","process_id":30876}
+STATUS_RETRY_EXIT=0
+Responding=True
+```
+
+No reinjection occurred after the duplicate result. The game remained visibly responsive and was closed normally with `Alt+F4`.

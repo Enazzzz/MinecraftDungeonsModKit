@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <span>
 #include <utility>
@@ -94,7 +95,10 @@ DWORD remaining_time(const std::chrono::steady_clock::time_point deadline) noexc
 	}
 	const auto remaining =
 		std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-	return static_cast<DWORD>(remaining > pipe_timeout_ms ? pipe_timeout_ms : remaining);
+	return static_cast<DWORD>(
+		remaining > std::numeric_limits<DWORD>::max()
+		? std::numeric_limits<DWORD>::max()
+		: remaining);
 }
 
 /// Retains operation storage if cancellation cannot be confirmed promptly.
@@ -220,10 +224,14 @@ std::expected<void, mcd::launcher::PipeClientFailure> transfer_exact(
 
 namespace mcd::launcher
 {
-/// Queries one runtime status pipe and returns its validated JSON payload.
-std::expected<std::string, PipeClientFailure> query_status(const DWORD process_id)
+namespace detail
 {
-	if(process_id == 0U)
+/// Queries one runtime pipe with a caller-supplied bounded timeout.
+std::expected<std::string, PipeClientFailure> query_status(
+	const DWORD process_id,
+	const DWORD timeout_ms)
+{
+	if(process_id == 0U || timeout_ms == 0U)
 	{
 		return std::unexpected(PipeClientFailure {
 			.error = PipeClientError::invalid_process_id,
@@ -233,7 +241,7 @@ std::expected<std::string, PipeClientFailure> query_status(const DWORD process_i
 
 	const std::wstring pipe_name =
 		L"\\\\.\\pipe\\mcd-runtime-" + std::to_wstring(process_id);
-	if(!WaitNamedPipeW(pipe_name.c_str(), pipe_timeout_ms))
+	if(!WaitNamedPipeW(pipe_name.c_str(), timeout_ms))
 	{
 		const DWORD error = GetLastError();
 		return std::unexpected(PipeClientFailure {
@@ -261,7 +269,7 @@ std::expected<std::string, PipeClientFailure> query_status(const DWORD process_i
 	}
 
 	const auto deadline =
-		std::chrono::steady_clock::now() + std::chrono::milliseconds(pipe_timeout_ms);
+		std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 	const auto request = protocol::encode({
 		.kind = protocol::MessageKind::status_request,
 		.payload = {},
@@ -320,6 +328,13 @@ std::expected<std::string, PipeClientFailure> query_status(const DWORD process_i
 	return std::string(
 		reinterpret_cast<const char*>(response->payload.data()),
 		response->payload.size());
+}
+}
+
+/// Queries one runtime status pipe and returns its validated JSON payload.
+std::expected<std::string, PipeClientFailure> query_status(const DWORD process_id)
+{
+	return detail::query_status(process_id, pipe_timeout_ms);
 }
 
 /// Returns a stable diagnostic name for one status-client failure.
