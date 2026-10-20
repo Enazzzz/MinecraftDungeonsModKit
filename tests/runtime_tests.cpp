@@ -105,29 +105,36 @@ void write_all(const HANDLE pipe, const std::span<const std::byte> bytes)
 	}
 }
 
+/// Reads every requested byte while accepting partial byte-mode pipe reads.
+void read_all(const HANDLE pipe, const std::span<std::byte> bytes)
+{
+	std::size_t offset = 0U;
+	while(offset < bytes.size())
+	{
+		DWORD transferred = 0U;
+		REQUIRE(ReadFile(
+			pipe,
+			bytes.data() + offset,
+			static_cast<DWORD>(bytes.size() - offset),
+			&transferred,
+			nullptr));
+		REQUIRE(transferred > 0U);
+		offset += transferred;
+	}
+}
+
 /// Reads exactly one complete bounded response frame.
 std::vector<std::byte> read_response(const HANDLE pipe)
 {
 	std::vector<std::byte> frame(mcd::protocol::header_size);
-	DWORD transferred = 0U;
-	REQUIRE(ReadFile(
-		pipe,
-		frame.data(),
-		static_cast<DWORD>(frame.size()),
-		&transferred,
-		nullptr));
-	REQUIRE(transferred == frame.size());
+	read_all(pipe, frame);
 
 	const std::uint32_t payload_size = mcd::wire::read_u32_le(frame, 7U);
 	REQUIRE(payload_size <= mcd::protocol::maximum_payload_size);
 	frame.resize(frame.size() + payload_size);
-	REQUIRE(ReadFile(
+	read_all(
 		pipe,
-		frame.data() + mcd::protocol::header_size,
-		payload_size,
-		&transferred,
-		nullptr));
-	REQUIRE(transferred == payload_size);
+		std::span<std::byte>(frame).subspan(mcd::protocol::header_size));
 	return frame;
 }
 
@@ -448,6 +455,76 @@ void test_io_failure_preserves_original_error()
 	REQUIRE(result.error == ERROR_ACCESS_DENIED);
 }
 
+/// Verifies successful cancellation resolves an aborted operation as stopped.
+void test_cancelled_operation_reports_stopped()
+{
+	const auto result = mcd::runtime::detail::resolve_cancellation(
+		TRUE,
+		ERROR_SUCCESS,
+		WAIT_OBJECT_0,
+		ERROR_SUCCESS,
+		FALSE,
+		ERROR_OPERATION_ABORTED);
+	REQUIRE(result.status == mcd::runtime::detail::IoStatus::stopped);
+	REQUIRE(result.error == ERROR_OPERATION_ABORTED);
+	REQUIRE(!result.operation_pending);
+}
+
+/// Verifies ERROR_NOT_FOUND is accepted only after resolving the completion race.
+void test_cancel_not_found_resolves_completion()
+{
+	const auto result = mcd::runtime::detail::resolve_cancellation(
+		FALSE,
+		ERROR_NOT_FOUND,
+		WAIT_OBJECT_0,
+		ERROR_SUCCESS,
+		TRUE,
+		ERROR_SUCCESS);
+	REQUIRE(result.status == mcd::runtime::detail::IoStatus::success);
+	REQUIRE(result.error == ERROR_SUCCESS);
+	REQUIRE(!result.operation_pending);
+}
+
+/// Verifies non-race cancellation failures retain their originating error.
+void test_cancel_failure_preserves_error()
+{
+	const auto result = mcd::runtime::detail::resolve_cancellation(
+		FALSE,
+		ERROR_ACCESS_DENIED,
+		WAIT_OBJECT_0,
+		ERROR_SUCCESS,
+		FALSE,
+		ERROR_OPERATION_ABORTED);
+	REQUIRE(result.status == mcd::runtime::detail::IoStatus::failed);
+	REQUIRE(result.error == ERROR_ACCESS_DENIED);
+	REQUIRE(!result.operation_pending);
+}
+
+/// Verifies bounded cancellation timeout retains pending-operation ownership.
+void test_cancel_timeout_retains_pending_operation()
+{
+	const auto result = mcd::runtime::detail::resolve_cancellation(
+		TRUE,
+		ERROR_SUCCESS,
+		WAIT_TIMEOUT,
+		ERROR_SUCCESS,
+		FALSE,
+		ERROR_IO_INCOMPLETE);
+	REQUIRE(result.status == mcd::runtime::detail::IoStatus::failed);
+	REQUIRE(result.error == ERROR_TIMEOUT);
+	REQUIRE(result.operation_pending);
+
+	const auto failed_cancel = mcd::runtime::detail::resolve_cancellation(
+		FALSE,
+		ERROR_ACCESS_DENIED,
+		WAIT_TIMEOUT,
+		ERROR_SUCCESS,
+		FALSE,
+		ERROR_IO_INCOMPLETE);
+	REQUIRE(failed_cancel.error == ERROR_ACCESS_DENIED);
+	REQUIRE(failed_cancel.operation_pending);
+}
+
 /// Runs one named test while reporting its diagnostic boundary.
 void run_test(const std::string_view name, void (*test)())
 {
@@ -480,5 +557,9 @@ int main()
 	run_test("pipe server stops while connected", &test_pipe_server_stops_while_connected);
 	run_test("pipe security targets logon SID", &test_pipe_security_targets_logon_sid);
 	run_test("I/O failure preserves original error", &test_io_failure_preserves_original_error);
+	run_test("cancelled operation reports stopped", &test_cancelled_operation_reports_stopped);
+	run_test("cancel not found resolves completion", &test_cancel_not_found_resolves_completion);
+	run_test("cancel failure preserves error", &test_cancel_failure_preserves_error);
+	run_test("cancel timeout retains pending operation", &test_cancel_timeout_retains_pending_operation);
 	return 0;
 }

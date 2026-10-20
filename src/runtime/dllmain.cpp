@@ -4,37 +4,30 @@
 
 namespace
 {
-/// Releases the worker-owned module reference atomically with thread exit.
-[[noreturn]] void exit_runtime_thread(const HMODULE module, const DWORD result) noexcept
+/// Pins this DLL without loading another module or invoking external code.
+bool pin_runtime_module(const HMODULE expected_module) noexcept
 {
-	FreeLibraryAndExitThread(module, result);
+	HMODULE pinned_module = nullptr;
+	if(!GetModuleHandleExW(
+		   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			   GET_MODULE_HANDLE_EX_FLAG_PIN,
+		   reinterpret_cast<LPCWSTR>(&pin_runtime_module),
+		   &pinned_module))
+	{
+		return false;
+	}
+	return pinned_module == expected_module;
 }
 
-/// Owns a module reference for the complete detached runtime worker lifetime.
+/// Runs runtime work while the process-lifetime module pin remains active.
 DWORD WINAPI mcd_runtime_thread(const LPVOID parameter)
 {
-	const auto attached_module = static_cast<HMODULE>(parameter);
-	HMODULE owned_module = nullptr;
-	if(!GetModuleHandleExW(
-		   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-		   reinterpret_cast<LPCWSTR>(&mcd_runtime_thread),
-		   &owned_module))
-	{
-		const DWORD error = GetLastError();
-		ExitThread(error);
-	}
-
-	if(owned_module != attached_module)
-	{
-		exit_runtime_thread(owned_module, ERROR_MOD_NOT_FOUND);
-	}
-
-	const DWORD result = mcd::runtime::Runtime::instance().start(owned_module);
-	exit_runtime_thread(owned_module, result);
+	const auto module = static_cast<HMODULE>(parameter);
+	return mcd::runtime::Runtime::instance().start(module);
 }
 }
 
-/// Starts a private worker that self-pins before performing any runtime work.
+/// Pins the image for process lifetime before scheduling detached runtime work.
 BOOL WINAPI DllMain(const HINSTANCE instance, const DWORD reason, LPVOID)
 {
 	if(reason != DLL_PROCESS_ATTACH)
@@ -47,10 +40,19 @@ BOOL WINAPI DllMain(const HINSTANCE instance, const DWORD reason, LPVOID)
 		return FALSE;
 	}
 
+	// Kernel32 module pinning does not load a DLL or invoke user code, so the
+	// process-attach callback keeps all loader-lock work within the safe subset.
+	if(!pin_runtime_module(instance))
+	{
+		return FALSE;
+	}
+
 	const HANDLE thread = CreateThread(nullptr, 0U, &mcd_runtime_thread, instance, 0U, nullptr);
 	if(thread == nullptr)
 	{
-		return FALSE;
+		// The irreversible pin leaves an inert image mapped, with no worker or
+		// callbacks to clean up, rather than exposing an unsafe unload path.
+		return TRUE;
 	}
 
 	CloseHandle(thread);

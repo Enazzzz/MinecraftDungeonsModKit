@@ -32,7 +32,9 @@ The launcher must report actionable errors and must not silently retry injection
 
 ### Runtime
 
-`mcd-runtime.dll` performs only minimal bookkeeping in `DllMain`. A dedicated initialization thread owns all scanning and setup so loader-lock-sensitive work does not occur in `DllMain`.
+`mcd-runtime.dll` performs only minimal bookkeeping in `DllMain`. Before scheduling detached work, process attach irreversibly pins the already loaded image with the Kernel32 `GetModuleHandleExW` process-lifetime pin. The pin prevents any injector or client `FreeLibrary` call from unmapping code or data while the worker can execute. A dedicated initialization thread owns all scanning and setup so loader-lock-sensitive work does not occur in `DllMain`; the pin operation itself neither loads another DLL nor invokes user code.
+
+Runtime shutdown is behavioral rather than an image unload: it stops accepting commands, cancels and resolves pending I/O, closes server and event handles, blocks new callbacks, drains active work, and lets every runtime-owned thread exit. The resulting image is inert but remains mapped until host-process exit. No runtime API exposes an unload path.
 
 Initialization proceeds in this order:
 
@@ -116,6 +118,8 @@ The first commands are:
 
 Malformed or unsupported requests receive explicit errors and cannot invoke arbitrary shell commands.
 
+Pipe shutdown uses `CancelIoEx` and a bounded completion wait. `ERROR_NOT_FOUND` is treated only as a completion race and the runtime still resolves the `OVERLAPPED` result. Other cancellation failures retain their originating Win32 error. If the kernel does not resolve an operation before the bound, the runtime closes the pipe handle and quarantines the heap-owned `OVERLAPPED` structure and transfer buffer for process lifetime; this avoids dangling kernel references without leaving a callback, worker, or auxiliary handle active.
+
 ### Offline Enforcement
 
 The launcher can create a named Windows Firewall outbound block rule scoped only to the full path of `Dungeons-Win64-Shipping.exe`. Rule installation requires elevation and is separate from normal injection. The launcher can display and remove the exact rule it owns.
@@ -137,7 +141,7 @@ Unreal access occurs on the game thread unless a service is explicitly documente
 - Pipe failure: keep the runtime operational and permit a later reconnect.
 - Plugin initialization failure: quarantine that plugin for the session and continue.
 - Hook failure: roll back every hook installed in the same transaction.
-- Runtime shutdown: stop accepting commands, block new callbacks, drain tasks, unload plugins, remove hooks, close logs, and unload only when safe.
+- Runtime shutdown: stop accepting commands, resolve pending I/O, block new callbacks, drain tasks, unload plugins, remove hooks, close logs and handles, and end every runtime-owned thread; keep the inert process-pinned image mapped until host exit.
 
 ## Verification
 

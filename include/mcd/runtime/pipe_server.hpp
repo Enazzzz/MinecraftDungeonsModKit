@@ -24,6 +24,7 @@ struct IoResult
 {
 	IoStatus status;
 	DWORD error;
+	bool operation_pending = false;
 };
 
 /// Returns a failed operation result retaining the supplied Win32 error.
@@ -31,6 +32,15 @@ struct IoResult
 {
 	return {.status = IoStatus::failed, .error = error};
 }
+
+/// Resolves one bounded CancelIoEx attempt without losing its source error.
+[[nodiscard]] IoResult resolve_cancellation(
+	BOOL cancel_succeeded,
+	DWORD cancel_error,
+	DWORD completion_wait,
+	DWORD wait_error,
+	BOOL completion_succeeded,
+	DWORD completion_error) noexcept;
 
 /// Builds a self-relative pipe descriptor for the current logon session.
 [[nodiscard]] std::vector<std::byte> build_pipe_security_descriptor();

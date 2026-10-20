@@ -4,7 +4,7 @@
 
 **Goal:** Build and verify a native launcher and injected runtime DLL that recognize the supported Minecraft Dungeons Steam executable and exchange a versioned status message.
 
-**Architecture:** A C++23 CMake project builds shared utility code, a command-line launcher, a Windows x64 DLL, and focused tests. The launcher verifies the executable, locates the running process, injects the DLL through `LoadLibraryW`, and then connects to a current-user local named pipe. The DLL performs minimal work in `DllMain`, initializes on a worker thread, validates its host build, starts the pipe server, and shuts down cleanly.
+**Architecture:** A C++23 CMake project builds shared utility code, a command-line launcher, a Windows x64 DLL, and focused tests. The launcher verifies the executable, locates the running process, injects the DLL through `LoadLibraryW`, and then connects to a current-user local named pipe. During process attach, the DLL irreversibly pins its existing image with the Kernel32 `GetModuleHandleExW` process-lifetime pin before scheduling a worker thread. Runtime shutdown stops the server, closes handles, and ends the worker; the inert DLL image remains mapped until host-process exit.
 
 **Tech Stack:** C++23, CMake 3.22+, Visual Studio 2022/MSVC, Windows API, BCrypt, CTest
 
@@ -335,7 +335,7 @@ Expected: compilation fails because `RuntimeStateMachine` is undefined.
 
 - [ ] **Step 3: Implement runtime initialization**
 
-`DllMain` stores its module handle, calls `DisableThreadLibraryCalls`, and starts one thread:
+`DllMain` calls `DisableThreadLibraryCalls`, pins its already loaded image for host-process lifetime with `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN)`, and only then starts one thread. This Kernel32-only operation does not load another DLL or invoke user code; all hashing, allocation, security construction, and pipe work remains outside the loader lock. The pin is intentionally never released: runtime shutdown joins its behavior to a fully inert state with no active server, handles, callbacks, or worker, while the image stays mapped until process exit.
 
 ```cpp
 /// Defers all runtime initialization until after the loader-lock callback returns.
@@ -345,9 +345,18 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 		return TRUE;
 	}
 	DisableThreadLibraryCalls(instance);
+	HMODULE pinned_module = nullptr;
+	if (!GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				GET_MODULE_HANDLE_EX_FLAG_PIN,
+			reinterpret_cast<LPCWSTR>(&DllMain),
+			&pinned_module) ||
+		pinned_module != instance) {
+		return FALSE;
+	}
 	const HANDLE thread = CreateThread(nullptr, 0, &mcd_runtime_thread, instance, 0, nullptr);
 	if (thread == nullptr) {
-		return FALSE;
+		return TRUE; // The pinned image remains inert when scheduling fails.
 	}
 	CloseHandle(thread);
 	return TRUE;

@@ -128,7 +128,7 @@ mcd-runtime.vcxproj -> ...\build\Debug\mcd-runtime.dll
 
 ### Production Corrections
 
-- The detached worker now acquires a module reference from its own private entry-point address before calling runtime code. Every owned-reference path ends in `FreeLibraryAndExitThread`, so the DLL cannot unload while runtime or server code remains active.
+- Superseded by the process-lifetime pin decision below: the image is pinned before detached work is scheduled and intentionally remains mapped until host exit.
 - Pipe security now selects the `SE_GROUP_LOGON_ID` entry from `TokenGroups`, sets owner and group from `TokenOwner` and `TokenPrimaryGroup`, and grants only generic read/write to that logon SID.
 - Connect, read, write, and overlapped-wait helpers now return an `IoResult` containing both status and the originating `DWORD`; every Win32 error is captured immediately at the failing call.
 - Deleted copy/move methods now carry concise ownership documentation.
@@ -209,3 +209,109 @@ mcd-runtime.vcxproj -> ...\build\Debug\mcd-runtime.dll
 4/4 Test #4: runtime .......... Passed
 100% tests passed, 0 tests failed out of 4
 ```
+
+## Final Gate Follow-Up: Process Pin and Cancellation
+
+### Process-Lifetime Pin Rationale
+
+`DllMain(DLL_PROCESS_ATTACH)` now calls:
+
+```cpp
+GetModuleHandleExW(
+	GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		GET_MODULE_HANDLE_EX_FLAG_PIN,
+	reinterpret_cast<LPCWSTR>(&pin_runtime_module),
+	&pinned_module);
+```
+
+before creating the detached worker. `GET_MODULE_HANDLE_EX_FLAG_PIN` makes the mapping irreversible until process termination, closing the race in which an injector could release its `LoadLibraryW` reference before the new thread acquired a temporary reference.
+
+This is kept within the documented safe `DllMain` subset:
+
+- it is a Kernel32 operation on an already loaded module
+- it does not call `LoadLibrary`, initialize another DLL, invoke user code, allocate runtime state, or synchronize with another thread
+- no caller-visible unload path remains
+
+If worker creation fails after the irreversible pin, `DllMain` returns success with no worker, callbacks, server, or owned handles; the image is inert but safely mapped. Normal runtime shutdown stops the server, resolves or safely quarantines pending I/O state, closes runtime handles, and lets the detached worker return. Only the image mapping remains until host exit.
+
+The implementation plan and native-runtime design now state this process-lifetime pin contract explicitly.
+
+### Bounded Cancellation Design
+
+- `CancelIoEx` is checked immediately and its exact `DWORD` is captured.
+- `ERROR_NOT_FOUND` is accepted only as a possible completion race; the code still waits for and reads the `OVERLAPPED` result.
+- Every other cancellation failure is returned unchanged after bounded completion resolution.
+- Cancellation completion waits are capped at 500 ms.
+- A timeout returns `ERROR_TIMEOUT`; a prior non-race cancellation error remains the primary returned error.
+- Each operation owns its `OVERLAPPED` structure and transfer buffer on the heap. If the bounded wait cannot prove completion, that state is quarantined for process lifetime before the pipe handle closes, preventing kernel use-after-free without retaining an auxiliary handle, callback, or thread.
+- Test-client response reads now loop until every header and payload byte is received, supporting partial byte-mode reads.
+
+### Final Gate RED Evidence
+
+Command:
+
+```powershell
+cmake --build build --config Debug --target mcd_runtime_tests
+```
+
+Observed result:
+
+```text
+runtime_tests.cpp: error C2039: 'resolve_cancellation':
+is not a member of 'mcd::runtime::detail'
+runtime_tests.cpp: error C3861: 'resolve_cancellation': identifier not found
+```
+
+This was the expected test-first failure for the missing bounded-cancellation seam.
+
+### Final Gate Verification
+
+Command:
+
+```powershell
+cmake --build build --config Debug --target mcd_runtime_tests mcd-runtime
+ctest --test-dir build -C Debug --output-on-failure -R "runtime|protocol"
+```
+
+Observed result:
+
+```text
+mcd-runtime.vcxproj -> ...\build\Debug\mcd-runtime.dll
+1/2 Test #3: protocol ... Passed
+2/2 Test #4: runtime .... Passed
+100% tests passed, 0 tests failed out of 2
+```
+
+Command:
+
+```powershell
+1..3 | ForEach-Object {
+	.\build\tests\Debug\mcd_runtime_tests.exe
+	if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+Observed result:
+
+```text
+PASS cancelled operation reports stopped
+PASS cancel not found resolves completion
+PASS cancel failure preserves error
+PASS cancel timeout retains pending operation
+```
+
+All focused runtime tests passed in each of three consecutive runs. The full Debug suite then passed:
+
+```text
+1/4 Test #1: smoke ............ Passed
+2/4 Test #2: build_identity ... Passed
+3/4 Test #3: protocol ......... Passed
+4/4 Test #4: runtime .......... Passed
+100% tests passed, 0 tests failed out of 4
+```
+
+### Final Gate Concerns
+
+No active handle, callback, or thread remains after runtime shutdown. In the pathological case where Windows does not resolve a cancelled operation within 500 ms, the operation's heap-only state is intentionally retained until process exit so kernel references can never outlive their storage.

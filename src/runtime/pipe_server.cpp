@@ -1,5 +1,6 @@
 #include "mcd/runtime/pipe_server.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -98,6 +99,23 @@ using mcd::runtime::detail::IoResult;
 using mcd::runtime::detail::IoStatus;
 using mcd::runtime::detail::io_failure;
 
+/// Owns every buffer and structure referenced by one pending operation.
+struct PendingOperation
+{
+	OVERLAPPED overlapped {};
+	std::vector<std::byte> buffer {};
+};
+
+/// Bounds the time spent resolving one cancellation request.
+inline constexpr DWORD cancellation_resolution_timeout_ms = 500U;
+
+/// Retains state that the kernel may still reference until process exit.
+void quarantine_pending_operation(
+	std::unique_ptr<PendingOperation> operation) noexcept
+{
+	(void)operation.release();
+}
+
 /// Throws a system error carrying a previously captured Win32 failure code.
 [[noreturn]] void throw_win32_error(const DWORD error, const char* operation)
 {
@@ -174,11 +192,11 @@ std::wstring pipe_name()
 /// Waits for one overlapped operation or cooperative shutdown.
 IoResult await_operation(
 	const HANDLE pipe,
-	OVERLAPPED& operation,
+	PendingOperation& operation,
 	const HANDLE stop_event,
 	DWORD& transferred)
 {
-	const std::array<HANDLE, 2> handles {stop_event, operation.hEvent};
+	const std::array<HANDLE, 2> handles {stop_event, pipe};
 	const DWORD wait_result = WaitForMultipleObjects(
 		static_cast<DWORD>(handles.size()),
 		handles.data(),
@@ -186,13 +204,30 @@ IoResult await_operation(
 		INFINITE);
 	if(wait_result == WAIT_OBJECT_0)
 	{
-		CancelIoEx(pipe, &operation);
-		const DWORD completion_wait = WaitForSingleObject(operation.hEvent, INFINITE);
-		if(completion_wait == WAIT_FAILED)
+		const BOOL cancel_succeeded = CancelIoEx(pipe, &operation.overlapped);
+		const DWORD cancel_error = cancel_succeeded ? ERROR_SUCCESS : GetLastError();
+		const DWORD completion_wait =
+			WaitForSingleObject(pipe, cancellation_resolution_timeout_ms);
+		const DWORD wait_error =
+			completion_wait == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+
+		BOOL completion_succeeded = FALSE;
+		DWORD completion_error = ERROR_IO_INCOMPLETE;
+		if(completion_wait == WAIT_OBJECT_0)
 		{
-			return io_failure(GetLastError());
+			completion_succeeded =
+				GetOverlappedResult(pipe, &operation.overlapped, &transferred, FALSE);
+			completion_error =
+				completion_succeeded ? ERROR_SUCCESS : GetLastError();
 		}
-		return {.status = IoStatus::stopped, .error = ERROR_OPERATION_ABORTED};
+
+		return mcd::runtime::detail::resolve_cancellation(
+			cancel_succeeded,
+			cancel_error,
+			completion_wait,
+			wait_error,
+			completion_succeeded,
+			completion_error);
 	}
 
 	if(wait_result == WAIT_FAILED)
@@ -203,7 +238,7 @@ IoResult await_operation(
 	{
 		return io_failure(ERROR_GEN_FAILURE);
 	}
-	if(!GetOverlappedResult(pipe, &operation, &transferred, FALSE))
+	if(!GetOverlappedResult(pipe, &operation.overlapped, &transferred, FALSE))
 	{
 		return io_failure(GetLastError());
 	}
@@ -221,20 +256,32 @@ IoResult transfer_exact(
 	std::size_t offset = 0U;
 	while(offset < bytes.size())
 	{
-		const HANDLE raw_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-		if(raw_event == nullptr)
+		auto operation = std::make_unique<PendingOperation>();
+		const std::size_t remaining = bytes.size() - offset;
+		operation->buffer.resize(remaining);
+		if(writing)
 		{
-			return io_failure(GetLastError());
+			std::copy_n(
+				bytes.data() + offset,
+				remaining,
+				operation->buffer.data());
 		}
-		UniqueHandle event(raw_event);
 
-		OVERLAPPED operation {};
-		operation.hEvent = event.get();
 		DWORD transferred = 0U;
-		const DWORD remaining = static_cast<DWORD>(bytes.size() - offset);
+		const DWORD transfer_size = static_cast<DWORD>(remaining);
 		const BOOL completed = writing
-			? WriteFile(pipe, bytes.data() + offset, remaining, nullptr, &operation)
-			: ReadFile(pipe, bytes.data() + offset, remaining, nullptr, &operation);
+			? WriteFile(
+				pipe,
+				operation->buffer.data(),
+				transfer_size,
+				nullptr,
+				&operation->overlapped)
+			: ReadFile(
+				pipe,
+				operation->buffer.data(),
+				transfer_size,
+				nullptr,
+				&operation->overlapped);
 
 		if(!completed)
 		{
@@ -244,13 +291,25 @@ IoResult transfer_exact(
 				return io_failure(error);
 			}
 
-			const IoResult result = await_operation(pipe, operation, stop_event, transferred);
+			const IoResult result = await_operation(
+				pipe,
+				*operation,
+				stop_event,
+				transferred);
 			if(result.status != IoStatus::success)
 			{
+				if(result.operation_pending)
+				{
+					quarantine_pending_operation(std::move(operation));
+				}
 				return result;
 			}
 		}
-		else if(!GetOverlappedResult(pipe, &operation, &transferred, TRUE))
+		else if(!GetOverlappedResult(
+					pipe,
+					&operation->overlapped,
+					&transferred,
+					TRUE))
 		{
 			return io_failure(GetLastError());
 		}
@@ -258,6 +317,13 @@ IoResult transfer_exact(
 		if(transferred == 0U)
 		{
 			return io_failure(ERROR_BROKEN_PIPE);
+		}
+		if(!writing)
+		{
+			std::copy_n(
+				operation->buffer.data(),
+				transferred,
+				bytes.data() + offset);
 		}
 		offset += transferred;
 	}
@@ -268,16 +334,8 @@ IoResult transfer_exact(
 /// Accepts one client while allowing shutdown to cancel the pending connection.
 IoResult connect_client(const HANDLE pipe, const HANDLE stop_event)
 {
-	const HANDLE raw_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-	if(raw_event == nullptr)
-	{
-		return io_failure(GetLastError());
-	}
-	UniqueHandle event(raw_event);
-
-	OVERLAPPED operation {};
-	operation.hEvent = event.get();
-	if(ConnectNamedPipe(pipe, &operation))
+	auto operation = std::make_unique<PendingOperation>();
+	if(ConnectNamedPipe(pipe, &operation->overlapped))
 	{
 		return {.status = IoStatus::success, .error = ERROR_SUCCESS};
 	}
@@ -293,7 +351,13 @@ IoResult connect_client(const HANDLE pipe, const HANDLE stop_event)
 	}
 
 	DWORD transferred = 0U;
-	return await_operation(pipe, operation, stop_event, transferred);
+	const IoResult result =
+		await_operation(pipe, *operation, stop_event, transferred);
+	if(result.operation_pending)
+	{
+		quarantine_pending_operation(std::move(operation));
+	}
+	return result;
 }
 
 /// Reads one complete frame after bounding its declared payload length.
@@ -343,6 +407,60 @@ std::vector<std::byte> status_payload(const std::string_view profile_id)
 
 namespace mcd::runtime::detail
 {
+/// Resolves one bounded CancelIoEx attempt without losing its source error.
+IoResult resolve_cancellation(
+	const BOOL cancel_succeeded,
+	const DWORD cancel_error,
+	const DWORD completion_wait,
+	const DWORD wait_error,
+	const BOOL completion_succeeded,
+	const DWORD completion_error) noexcept
+{
+	const bool cancellation_failed =
+		!cancel_succeeded && cancel_error != ERROR_NOT_FOUND;
+	if(completion_wait == WAIT_TIMEOUT)
+	{
+		return {
+			.status = IoStatus::failed,
+			.error = cancellation_failed ? cancel_error : ERROR_TIMEOUT,
+			.operation_pending = true,
+		};
+	}
+	if(completion_wait == WAIT_FAILED)
+	{
+		return {
+			.status = IoStatus::failed,
+			.error = cancellation_failed ? cancel_error : wait_error,
+			.operation_pending = true,
+		};
+	}
+	if(completion_wait != WAIT_OBJECT_0)
+	{
+		return {
+			.status = IoStatus::failed,
+			.error = cancellation_failed ? cancel_error : ERROR_GEN_FAILURE,
+			.operation_pending = true,
+		};
+	}
+	if(cancellation_failed)
+	{
+		return io_failure(cancel_error);
+	}
+	if(completion_succeeded)
+	{
+		if(cancel_succeeded)
+		{
+			return {.status = IoStatus::stopped, .error = ERROR_OPERATION_ABORTED};
+		}
+		return {.status = IoStatus::success, .error = ERROR_SUCCESS};
+	}
+	if(completion_error == ERROR_OPERATION_ABORTED)
+	{
+		return {.status = IoStatus::stopped, .error = completion_error};
+	}
+	return io_failure(completion_error);
+}
+
 /// Builds a self-relative pipe descriptor for the current logon session.
 std::vector<std::byte> build_pipe_security_descriptor()
 {
