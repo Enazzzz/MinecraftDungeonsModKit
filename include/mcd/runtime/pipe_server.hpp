@@ -16,6 +16,7 @@ enum class IoStatus
 {
 	success,
 	stopped,
+	timed_out,
 	failed,
 };
 
@@ -42,6 +43,15 @@ struct IoResult
 	BOOL completion_succeeded,
 	DWORD completion_error) noexcept;
 
+/// Resolves deadline cancellation while preserving completion races.
+[[nodiscard]] IoResult resolve_timeout_cancellation(
+	BOOL cancel_succeeded,
+	DWORD cancel_error,
+	DWORD completion_wait,
+	DWORD wait_error,
+	BOOL completion_succeeded,
+	DWORD completion_error) noexcept;
+
 /// Builds a self-relative pipe descriptor for the current logon session.
 [[nodiscard]] std::vector<std::byte> build_pipe_security_descriptor();
 }
@@ -50,8 +60,10 @@ struct IoResult
 class PipeServer
 {
 public:
-	/// Creates a stopped server for the current process and build profile.
-	explicit PipeServer(std::string_view profile_id);
+	/// Creates a stopped server with a bounded per-session I/O timeout.
+	explicit PipeServer(
+		std::string_view profile_id,
+		DWORD session_io_timeout_ms = 5'000U);
 
 	/// Releases the server stop event and any related operating-system state.
 	~PipeServer() noexcept;

@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -230,11 +232,29 @@ std::wstring pipe_name()
 	return L"\\\\.\\pipe\\mcd-runtime-" + std::to_wstring(GetCurrentProcessId());
 }
 
-/// Waits for one overlapped operation or cooperative shutdown.
+/// Returns the remaining whole milliseconds before one session deadline.
+DWORD remaining_time(
+	const std::chrono::steady_clock::time_point deadline) noexcept
+{
+	const auto now = std::chrono::steady_clock::now();
+	if(now >= deadline)
+	{
+		return 0U;
+	}
+	const auto remaining =
+		std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+	return static_cast<DWORD>(
+		remaining > std::numeric_limits<DWORD>::max()
+		? std::numeric_limits<DWORD>::max()
+		: remaining);
+}
+
+/// Waits for one overlapped operation, cooperative shutdown, or client deadline.
 IoResult await_operation(
 	const HANDLE pipe,
 	PendingOperation& operation,
 	const HANDLE stop_event,
+	const DWORD timeout_ms,
 	DWORD& transferred)
 {
 	const std::array<HANDLE, 2> handles {stop_event, operation.event.get()};
@@ -242,8 +262,8 @@ IoResult await_operation(
 		static_cast<DWORD>(handles.size()),
 		handles.data(),
 		FALSE,
-		INFINITE);
-	if(wait_result == WAIT_OBJECT_0)
+		timeout_ms);
+	if(wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT)
 	{
 		const BOOL cancel_succeeded = CancelIoEx(pipe, &operation.overlapped);
 		const DWORD cancel_error = cancel_succeeded ? ERROR_SUCCESS : GetLastError();
@@ -264,6 +284,16 @@ IoResult await_operation(
 				completion_succeeded ? ERROR_SUCCESS : GetLastError();
 		}
 
+		if(wait_result == WAIT_TIMEOUT)
+		{
+			return mcd::runtime::detail::resolve_timeout_cancellation(
+				cancel_succeeded,
+				cancel_error,
+				completion_wait,
+				wait_error,
+				completion_succeeded,
+				completion_error);
+		}
 		return mcd::runtime::detail::resolve_cancellation(
 			cancel_succeeded,
 			cancel_error,
@@ -299,11 +329,16 @@ IoResult transfer_exact(
 	const HANDLE pipe,
 	const std::span<std::byte> bytes,
 	const bool writing,
-	const HANDLE stop_event)
+	const HANDLE stop_event,
+	const std::chrono::steady_clock::time_point deadline)
 {
 	std::size_t offset = 0U;
 	while(offset < bytes.size())
 	{
+		if(std::chrono::steady_clock::now() >= deadline)
+		{
+			return {.status = IoStatus::timed_out, .error = ERROR_TIMEOUT};
+		}
 		auto operation = std::make_unique<PendingOperation>();
 		const IoResult initialized = initialize_operation(*operation);
 		if(initialized.status != IoStatus::success)
@@ -348,6 +383,7 @@ IoResult transfer_exact(
 				pipe,
 				*operation,
 				stop_event,
+				remaining_time(deadline),
 				transferred);
 			if(result.status != IoStatus::success)
 			{
@@ -417,7 +453,7 @@ IoResult connect_client(const HANDLE pipe, const HANDLE stop_event)
 
 	DWORD transferred = 0U;
 	const IoResult result =
-		await_operation(pipe, *operation, stop_event, transferred);
+		await_operation(pipe, *operation, stop_event, INFINITE, transferred);
 	if(result.operation_pending)
 	{
 		quarantine_pending_operation(std::move(operation));
@@ -429,10 +465,11 @@ IoResult connect_client(const HANDLE pipe, const HANDLE stop_event)
 IoResult read_frame(
 	const HANDLE pipe,
 	const HANDLE stop_event,
+	const std::chrono::steady_clock::time_point deadline,
 	std::vector<std::byte>& frame)
 {
 	frame.assign(mcd::protocol::header_size, std::byte {0});
-	IoResult result = transfer_exact(pipe, frame, false, stop_event);
+	IoResult result = transfer_exact(pipe, frame, false, stop_event, deadline);
 	if(result.status != IoStatus::success)
 	{
 		return result;
@@ -454,7 +491,8 @@ IoResult read_frame(
 		pipe,
 		std::span<std::byte>(frame).subspan(mcd::protocol::header_size),
 		false,
-		stop_event);
+		stop_event,
+		deadline);
 }
 
 /// Returns the JSON status payload exposed to trusted local clients.
@@ -531,6 +569,30 @@ IoResult resolve_cancellation(
 	return io_failure(completion_error);
 }
 
+/// Resolves deadline cancellation while preserving completion races.
+IoResult resolve_timeout_cancellation(
+	const BOOL cancel_succeeded,
+	const DWORD cancel_error,
+	const DWORD completion_wait,
+	const DWORD wait_error,
+	const BOOL completion_succeeded,
+	const DWORD completion_error) noexcept
+{
+	IoResult result = resolve_cancellation(
+		cancel_succeeded,
+		cancel_error,
+		completion_wait,
+		wait_error,
+		completion_succeeded,
+		completion_error);
+	if(result.status == IoStatus::stopped)
+	{
+		result.status = IoStatus::timed_out;
+		result.error = ERROR_TIMEOUT;
+	}
+	return result;
+}
+
 /// Builds a self-relative pipe descriptor for the current logon session.
 std::vector<std::byte> build_pipe_security_descriptor()
 {
@@ -577,10 +639,17 @@ namespace mcd::runtime
 class PipeServer::Impl
 {
 public:
-	/// Creates the cooperative stop event and records the selected profile.
-	explicit Impl(const std::string_view profile_id)
-		: profile_id_(profile_id)
+	/// Creates the stop event and records profile plus session I/O bound.
+	Impl(
+		const std::string_view profile_id,
+		const DWORD session_io_timeout_ms)
+		: profile_id_(profile_id),
+		  session_io_timeout_ms_(session_io_timeout_ms)
 	{
+		if(session_io_timeout_ms_ == 0U)
+		{
+			throw std::invalid_argument("Pipe session I/O timeout must be nonzero.");
+		}
 		const HANDLE raw_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 		if(raw_stop_event == nullptr)
 		{
@@ -692,8 +761,12 @@ private:
 	/// Handles at most one status request for the connected client.
 	[[nodiscard]] IoResult serve_client(const HANDLE pipe) noexcept
 	{
+		const auto deadline =
+			std::chrono::steady_clock::now() +
+			std::chrono::milliseconds(session_io_timeout_ms_);
 		std::vector<std::byte> frame;
-		const IoResult read_result = read_frame(pipe, stop_event_.get(), frame);
+		const IoResult read_result =
+			read_frame(pipe, stop_event_.get(), deadline, frame);
 		if(read_result.status != IoStatus::success)
 		{
 			return read_result;
@@ -712,7 +785,8 @@ private:
 			.payload = status_payload(profile_id_),
 		};
 		std::vector<std::byte> bytes = mcd::protocol::encode(response);
-		const IoResult write_result = transfer_exact(pipe, bytes, true, stop_event_.get());
+		const IoResult write_result =
+			transfer_exact(pipe, bytes, true, stop_event_.get(), deadline);
 		if(write_result.status != IoStatus::success)
 		{
 			return write_result;
@@ -723,16 +797,21 @@ private:
 			pipe,
 			std::span<std::byte>(&trailing_byte, 1U),
 			false,
-			stop_event_.get());
+			stop_event_.get(),
+			deadline);
 	}
 
 	UniqueHandle stop_event_;
 	std::string profile_id_;
+	DWORD session_io_timeout_ms_;
 };
 
-/// Creates a stopped server for the current process and build profile.
-PipeServer::PipeServer(const std::string_view profile_id)
-	: implementation_(std::make_unique<Impl>(profile_id))
+/// Creates a stopped server with a bounded per-session I/O timeout.
+PipeServer::PipeServer(
+	const std::string_view profile_id,
+	const DWORD session_io_timeout_ms)
+	: implementation_(
+		std::make_unique<Impl>(profile_id, session_io_timeout_ms))
 {
 }
 

@@ -368,6 +368,41 @@ void test_pipe_server_recovers_after_malformed_disconnect()
 	REQUIRE(result.get() == ERROR_SUCCESS);
 }
 
+/// Verifies a connected partial frame times out without stopping later sessions.
+void test_pipe_server_recovers_after_partial_frame_timeout()
+{
+	mcd::runtime::PipeServer server("test-profile", 100U);
+	auto result = std::async(std::launch::async, [&server] {
+		return server.run();
+	});
+	const HANDLE stalled_client = connect_client(
+		std::chrono::steady_clock::now() + std::chrono::seconds(2));
+	const std::byte fragment {'M'};
+	write_all(stalled_client, std::span {&fragment, 1U});
+	wait_for_disconnect(
+		stalled_client,
+		std::chrono::steady_clock::now() + std::chrono::seconds(2));
+	REQUIRE(result.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
+
+	const HANDLE valid_client = connect_client(
+		std::chrono::steady_clock::now() + std::chrono::seconds(2));
+	const auto request = mcd::protocol::encode({
+		.kind = mcd::protocol::MessageKind::status_request,
+		.payload = {},
+	});
+	write_all(valid_client, request);
+	const auto response = mcd::protocol::decode(read_response(valid_client));
+	REQUIRE(response.has_value());
+	REQUIRE(response->kind == mcd::protocol::MessageKind::status_response);
+	REQUIRE(!response->payload.empty());
+
+	CloseHandle(valid_client);
+	CloseHandle(stalled_client);
+	server.request_stop();
+	REQUIRE(result.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+	REQUIRE(result.get() == ERROR_SUCCESS);
+}
+
 /// Verifies oversized framing is rejected before a payload is read.
 void test_pipe_server_rejects_oversized_frame()
 {
@@ -571,6 +606,42 @@ void test_signaled_incomplete_result_remains_pending()
 	REQUIRE(result.operation_pending);
 }
 
+/// Verifies a stalled write cancellation is classified as a client timeout.
+void test_stalled_write_timeout_remains_client_scoped()
+{
+	const auto cancelled = mcd::runtime::detail::resolve_timeout_cancellation(
+		TRUE,
+		ERROR_SUCCESS,
+		WAIT_OBJECT_0,
+		ERROR_SUCCESS,
+		FALSE,
+		ERROR_OPERATION_ABORTED);
+	REQUIRE(cancelled.status == mcd::runtime::detail::IoStatus::timed_out);
+	REQUIRE(cancelled.error == ERROR_TIMEOUT);
+	REQUIRE(!cancelled.operation_pending);
+
+	const auto completion_race = mcd::runtime::detail::resolve_timeout_cancellation(
+		FALSE,
+		ERROR_NOT_FOUND,
+		WAIT_OBJECT_0,
+		ERROR_SUCCESS,
+		TRUE,
+		ERROR_SUCCESS);
+	REQUIRE(completion_race.status == mcd::runtime::detail::IoStatus::success);
+	REQUIRE(!completion_race.operation_pending);
+
+	const auto unresolved = mcd::runtime::detail::resolve_timeout_cancellation(
+		TRUE,
+		ERROR_SUCCESS,
+		WAIT_TIMEOUT,
+		ERROR_SUCCESS,
+		FALSE,
+		ERROR_IO_INCOMPLETE);
+	REQUIRE(unresolved.status == mcd::runtime::detail::IoStatus::failed);
+	REQUIRE(unresolved.error == ERROR_TIMEOUT);
+	REQUIRE(unresolved.operation_pending);
+}
+
 /// Runs one named test while reporting its diagnostic boundary.
 void run_test(const std::string_view name, void (*test)())
 {
@@ -602,6 +673,9 @@ int main()
 	run_test(
 		"pipe server recovers after malformed disconnect",
 		&test_pipe_server_recovers_after_malformed_disconnect);
+	run_test(
+		"pipe server recovers after partial frame timeout",
+		&test_pipe_server_recovers_after_partial_frame_timeout);
 	run_test("pipe server rejects oversized frame", &test_pipe_server_rejects_oversized_frame);
 	run_test("pipe server stops while connected", &test_pipe_server_stops_while_connected);
 	run_test("pipe security targets logon SID", &test_pipe_security_targets_logon_sid);
@@ -611,5 +685,8 @@ int main()
 	run_test("cancel failure preserves error", &test_cancel_failure_preserves_error);
 	run_test("cancel timeout retains pending operation", &test_cancel_timeout_retains_pending_operation);
 	run_test("signaled incomplete result remains pending", &test_signaled_incomplete_result_remains_pending);
+	run_test(
+		"stalled write timeout remains client scoped",
+		&test_stalled_write_timeout_remains_client_scoped);
 	return 0;
 }
