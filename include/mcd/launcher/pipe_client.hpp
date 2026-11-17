@@ -3,6 +3,8 @@
 #include <expected>
 #include <string>
 
+#include "mcd/protocol.hpp"
+
 #include <windows.h>
 
 namespace mcd::launcher
@@ -37,11 +39,16 @@ namespace detail
 /// Queries one runtime pipe with a caller-supplied bounded timeout.
 [[nodiscard]] std::expected<std::string, PipeClientFailure> query_status(
 	DWORD process_id,
-	DWORD timeout_ms);
+	DWORD timeout_ms,
+	mcd::protocol::MessageKind request = mcd::protocol::MessageKind::status_request,
+	mcd::protocol::MessageKind response = mcd::protocol::MessageKind::status_response);
 }
 
 /// Queries one runtime status pipe and returns its validated JSON payload.
 [[nodiscard]] std::expected<std::string, PipeClientFailure> query_status(DWORD process_id);
+
+/// Queries the runtime for its validated Unreal object-array report.
+[[nodiscard]] std::expected<std::string, PipeClientFailure> query_objects(DWORD process_id);
 
 /// Returns a stable diagnostic name for one status-client failure.
 [[nodiscard]] std::string pipe_error_message(const PipeClientFailure& failure);

@@ -14,6 +14,10 @@ include(cmake/compiler_options.cmake)
 
 add_library(mcd-common STATIC
 	src/common/build_identity.cpp
+	src/common/frame_overlay.cpp
+	src/common/object_array.cpp
+	src/common/x64_prologue.cpp
+	src/common/pattern.cpp
 	src/common/protocol.cpp
 	src/common/sha256_windows.cpp
 )
@@ -21,11 +25,13 @@ target_include_directories(mcd-common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_link_libraries(mcd-common PUBLIC mcd_project_options PRIVATE bcrypt ntdll)
 
 add_library(mcd-runtime-core STATIC
+	src/runtime/frame_mark.cpp
+	src/runtime/object_scan.cpp
 	src/runtime/pipe_server.cpp
 	src/runtime/runtime.cpp
 )
 target_include_directories(mcd-runtime-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(mcd-runtime-core PUBLIC mcd_project_options mcd-common PRIVATE advapi32)
+target_link_libraries(mcd-runtime-core PUBLIC mcd_project_options mcd-common PRIVATE advapi32 d3d11 dxgi psapi)
 
 add_library(mcd-launcher-core STATIC
 	src/launcher/injector.cpp
@@ -44,6 +50,7 @@ set_target_properties(mcd-runtime PROPERTIES PREFIX "")
 
 target_link_libraries(mcd-launcher PRIVATE mcd_project_options mcd-launcher-core)
 target_link_libraries(mcd-runtime PRIVATE mcd_project_options mcd-runtime-core)
+target_link_options(mcd-runtime PRIVATE /CETCOMPAT)
 
 include(CTest)
 if(BUILD_TESTING)

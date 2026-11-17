@@ -19,6 +19,8 @@ constexpr mcd::BuildProfile supported_profile()
 				std::byte {0xAE}, std::byte {0x86}, std::byte {0x15}, std::byte {0x64},
 				std::byte {0xA4}, std::byte {0xF5}, std::byte {0xCC}, std::byte {0x73},
 			},
+		.names_global_rva = 0x4692538U,
+		.object_array_rva = 0x4696838U,
 	};
 }
 
@@ -81,6 +83,17 @@ std::optional<BuildProfile> identify_build(
 		return profile;
 	}
 
+	return std::nullopt;
+}
+
+/// Returns the supported profile with the supplied id.
+std::optional<BuildProfile> profile_for_id(const std::string_view id)
+{
+	constexpr BuildProfile profile = supported_profile();
+	if(id == profile.id)
+	{
+		return profile;
+	}
 	return std::nullopt;
 }
 }

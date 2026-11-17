@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "mcd/build_identity.hpp"
+#include "mcd/runtime/frame_mark.hpp"
 #include "mcd/runtime/pipe_server.hpp"
 
 namespace
@@ -142,6 +143,8 @@ DWORD Runtime::start(const HMODULE module) noexcept
 			server_ = std::make_unique<PipeServer>(profile->id);
 			server = server_.get();
 		}
+
+		(void)install_frame_mark();
 
 		if(!state_.transition_to_ready())
 		{

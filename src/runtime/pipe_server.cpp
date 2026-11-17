@@ -17,6 +17,7 @@
 #include <sddl.h>
 
 #include "mcd/protocol.hpp"
+#include "mcd/runtime/runtime.hpp"
 #include "mcd/wire.hpp"
 
 namespace
@@ -773,16 +774,36 @@ private:
 		}
 
 		const auto request = mcd::protocol::decode(frame);
-		if(!request ||
-		   request->kind != mcd::protocol::MessageKind::status_request ||
-		   !request->payload.empty())
+		if(!request || !request->payload.empty())
+		{
+			return {.status = IoStatus::success, .error = ERROR_SUCCESS};
+		}
+		std::vector<std::byte> payload;
+		mcd::protocol::MessageKind response_kind {};
+		if(request->kind == mcd::protocol::MessageKind::status_request)
+		{
+			payload = status_payload(profile_id_);
+			response_kind = mcd::protocol::MessageKind::status_response;
+		}
+		else if(request->kind == mcd::protocol::MessageKind::objects_request)
+		{
+			const auto report = discover_host_objects(profile_id_);
+			const auto bounded = report.size() > mcd::protocol::maximum_payload_size
+				? std::string("{\"error\":\"discovery report exceeded 64 KiB\"}")
+				: report;
+			payload.assign(
+				reinterpret_cast<const std::byte*>(bounded.data()),
+				reinterpret_cast<const std::byte*>(bounded.data()) + bounded.size());
+			response_kind = mcd::protocol::MessageKind::objects_response;
+		}
+		else
 		{
 			return {.status = IoStatus::success, .error = ERROR_SUCCESS};
 		}
 
 		const mcd::protocol::Message response {
-			.kind = mcd::protocol::MessageKind::status_response,
-			.payload = status_payload(profile_id_),
+			.kind = response_kind,
+			.payload = std::move(payload),
 		};
 		std::vector<std::byte> bytes = mcd::protocol::encode(response);
 		const IoResult write_result =

@@ -22,6 +22,8 @@ enum class MessageKind : std::uint8_t
 {
 	status_request = 1U,
 	status_response = 2U,
+	objects_request = 3U,
+	objects_response = 4U,
 };
 
 /// Names the reasons that a wire frame can be rejected.

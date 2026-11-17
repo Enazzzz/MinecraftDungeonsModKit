@@ -238,7 +238,9 @@ bool server_process_matches(
 /// Queries one runtime pipe with a caller-supplied bounded timeout.
 std::expected<std::string, PipeClientFailure> query_status(
 	const DWORD process_id,
-	const DWORD timeout_ms)
+	const DWORD timeout_ms,
+	const protocol::MessageKind request_kind,
+	const protocol::MessageKind response_kind)
 {
 	if(process_id == 0U || timeout_ms == 0U)
 	{
@@ -298,7 +300,7 @@ std::expected<std::string, PipeClientFailure> query_status(
 	const auto deadline =
 		std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 	const auto request = protocol::encode({
-		.kind = protocol::MessageKind::status_request,
+		.kind = request_kind,
 		.payload = {},
 	});
 	auto mutable_request = request;
@@ -344,7 +346,7 @@ std::expected<std::string, PipeClientFailure> query_status(
 			.win32_error = ERROR_INVALID_DATA,
 		});
 	}
-	if(response->kind != protocol::MessageKind::status_response)
+	if(response->kind != response_kind)
 	{
 		return std::unexpected(PipeClientFailure {
 			.error = PipeClientError::unexpected_response,
@@ -362,6 +364,16 @@ std::expected<std::string, PipeClientFailure> query_status(
 std::expected<std::string, PipeClientFailure> query_status(const DWORD process_id)
 {
 	return detail::query_status(process_id, pipe_timeout_ms);
+}
+
+/// Queries the runtime for its validated Unreal object-array report.
+std::expected<std::string, PipeClientFailure> query_objects(const DWORD process_id)
+{
+	return detail::query_status(
+		process_id,
+		pipe_timeout_ms,
+		protocol::MessageKind::objects_request,
+		protocol::MessageKind::objects_response);
 }
 
 /// Returns a stable diagnostic name for one status-client failure.

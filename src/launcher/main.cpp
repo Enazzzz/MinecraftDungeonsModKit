@@ -121,7 +121,8 @@ void print_usage()
 		<< L"usage:\n"
 		<< L"  mcd-launcher inspect <game-exe>\n"
 		<< L"  mcd-launcher inject <game-exe> <runtime-dll>\n"
-		<< L"  mcd-launcher status <pid>\n";
+		<< L"  mcd-launcher status <pid>\n"
+		<< L"  mcd-launcher objects <pid>\n";
 }
 
 /// Runs exact-file inspection and reports whether the build is supported.
@@ -217,6 +218,28 @@ ExitCode run_status(const wchar_t* process_id_text)
 	std::wcout << std::wstring(status->begin(), status->end()) << L'\n';
 	return ExitCode::success;
 }
+
+/// Queries and prints the validated Unreal object-array report.
+ExitCode run_objects(const wchar_t* process_id_text)
+{
+	const auto process_id = mcd::launcher::parse_process_id(process_id_text);
+	if(!process_id)
+	{
+		std::wcerr << L"error: process ID must be a nonzero decimal integer\n";
+		return ExitCode::usage;
+	}
+
+	const auto report = mcd::launcher::query_objects(*process_id);
+	if(!report)
+	{
+		const auto message = mcd::launcher::pipe_error_message(report.error());
+		std::wcerr << L"error: " << std::wstring(message.begin(), message.end())
+				   << L" (" << report.error().win32_error << L")\n";
+		return ExitCode::status_error;
+	}
+	std::wcout << std::wstring(report->begin(), report->end()) << L'\n';
+	return ExitCode::success;
+}
 }
 
 /// Dispatches the fail-closed launcher command line.
@@ -233,6 +256,10 @@ int wmain(const int argument_count, wchar_t* arguments[])
 	if(argument_count == 3 && std::wstring_view(arguments[1]) == L"status")
 	{
 		return static_cast<int>(run_status(arguments[2]));
+	}
+	if(argument_count == 3 && std::wstring_view(arguments[1]) == L"objects")
+	{
+		return static_cast<int>(run_objects(arguments[2]));
 	}
 
 	print_usage();

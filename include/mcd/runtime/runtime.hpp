@@ -3,6 +3,8 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 
 #include <windows.h>
 
@@ -50,6 +52,9 @@ public:
 private:
 	std::atomic<State> state_ {State::dormant};
 };
+
+/// Reads the supported build's name pool and chunked UObject array.
+[[nodiscard]] std::string discover_host_objects(std::string_view profile_id);
 
 /// Owns process validation and the local control-server lifecycle.
 class Runtime

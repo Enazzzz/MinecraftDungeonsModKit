@@ -22,7 +22,9 @@ constexpr std::array<std::byte, 4> protocol_magic()
 constexpr bool is_valid_message_kind(const std::uint8_t value)
 {
 	return value == static_cast<std::uint8_t>(mcd::protocol::MessageKind::status_request) ||
-		value == static_cast<std::uint8_t>(mcd::protocol::MessageKind::status_response);
+		value == static_cast<std::uint8_t>(mcd::protocol::MessageKind::status_response) ||
+		value == static_cast<std::uint8_t>(mcd::protocol::MessageKind::objects_request) ||
+		value == static_cast<std::uint8_t>(mcd::protocol::MessageKind::objects_response);
 }
 
 /// Converts one raw message kind byte into its typed protocol enum.
